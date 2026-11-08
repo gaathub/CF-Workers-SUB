@@ -28,8 +28,7 @@ const DEFAULT_NODE_EDIT_CONFIG = {
     replaceTarget: '', replaceWith: '',
     globalRename: '', addPrefix: '', addSuffix: '',
     autoEmoji: true, deepDeduplicate: true, sortNodes: true, dropInvalidNodes: true,
-    specificRules: {}, // 专属节点的特殊前后缀规则
-    outputLimit: 0, favorites: [] // 0 表示不限制；收藏节点优先保留
+    specificRules: {} // 专属节点的特殊前后缀规则
 };
 
 export default {
@@ -85,42 +84,24 @@ export default {
                 const data = JSON.parse(textData);
 
                 // 1. 真实抓取远程链接的内容
-                const previewReport = { failures: [] };
                 const rawResolved = await resolveLinksToNodes(
                     data.links || '',
                     request,
-                    userAgentHeader,
-                    previewReport
+                    userAgentHeader
                 );
 
                 // 2. 将抓取到的裸节点输入二次编辑引擎处理
-                const previewConfig = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG, data.config || {});
-                const previewLimit = Number(previewConfig.outputLimit || 0);
-                if (!Number.isInteger(previewLimit) || previewLimit < 0 || previewLimit > 10000) {
-                    return new Response(JSON.stringify({ error: '节点数量限制必须是 0 至 10000 的整数' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                }
-                const processedArray = processNodes(rawResolved, previewConfig);
+                const processedArray = processNodes(rawResolved, data.config || {});
 
-                // 3. 自定义节点独立解析，不执行普通 Rules 过滤
+                // 3. 处理自定义节点（不受上方过滤规则限制）
                 const customArray = processNodes(
                     data.customNodes || '',
-                    Object.assign({}, previewConfig, { isCustom: true })
+                    Object.assign({}, data.config, { isCustom: true })
                 );
-                customArray.forEach(node => { node.isCustom = true; });
-
-                // 4. 合并后执行收藏保护与节点数量限制；与正式订阅共用同一算法
-                const mergedArray = processedArray.concat(customArray);
-                const limitedArray = applyNodeLimit(mergedArray, previewConfig);
 
                 return new Response(JSON.stringify({
-                    nodes: limitedArray,
-                    customNodes: [],
-                    totalNodes: mergedArray.length,
-                    outputNodes: limitedArray.length,
-                    favoriteCount: limitedArray.filter(n => previewConfig.favorites.includes(n.identifier)).length,
-                    unmatchedFavorites: previewConfig.favorites.filter(id => !mergedArray.some(n => n.identifier === id)),
-                    outputLimit: Number(previewConfig.outputLimit) || 0,
-                    failures: previewReport.failures || []
+                    nodes: processedArray,
+                    customNodes: customArray
                 }), {
                     status: 200,
                     headers: { "Content-Type": "application/json;charset=utf-8" }
@@ -202,26 +183,14 @@ export default {
                 if (userAgent.includes('mozilla') && !url.search) {
                     return Response.redirect(`${url.origin}/admin`, 302);
                 } else {
-                    // 新版统一快照优先；旧 KV 键作为兼容回退
-                    const snapshotText = await env.KV.get('ADMIN_CONFIG_SNAPSHOT.json');
-                    if (snapshotText) {
+                    MainData = await env.KV.get('LINK.txt') || MainData;
+                    customOutputNodes = await env.KV.get('CUSTOM_NODES.txt') || "";
+
+                    let kvCfg = await env.KV.get('EDIT_CONFIG.json');
+                    if (kvCfg) {
                         try {
-                            const snapshot = JSON.parse(snapshotText);
-                            MainData = typeof snapshot.links === 'string' ? snapshot.links : (await env.KV.get('LINK.txt') || MainData);
-                            customOutputNodes = typeof snapshot.customNodes === 'string' ? snapshot.customNodes : (await env.KV.get('CUSTOM_NODES.txt') || '');
-                            Object.assign(dynamicConfig, snapshot.config || {});
-                        } catch (e) {
-                            console.error('统一配置快照读取失败，回退旧配置:', e);
-                            MainData = await env.KV.get('LINK.txt') || MainData;
-                            customOutputNodes = await env.KV.get('CUSTOM_NODES.txt') || '';
-                            const oldCfg = await env.KV.get('EDIT_CONFIG.json');
-                            if (oldCfg) { try { Object.assign(dynamicConfig, JSON.parse(oldCfg)); } catch (_) {} }
-                        }
-                    } else {
-                        MainData = await env.KV.get('LINK.txt') || MainData;
-                        customOutputNodes = await env.KV.get('CUSTOM_NODES.txt') || '';
-                        const kvCfg = await env.KV.get('EDIT_CONFIG.json');
-                        if (kvCfg) { try { Object.assign(dynamicConfig, JSON.parse(kvCfg)); } catch (_) {} }
+                            Object.assign(dynamicConfig, JSON.parse(kvCfg));
+                        } catch (e) {}
                     }
                 }
             } else {
@@ -308,12 +277,13 @@ export default {
                 customOutputNodes,
                 Object.assign({}, dynamicConfig, { isCustom: true })
             );
-            customArray.forEach(node => { node.isCustom = true; });
 
-            // 合并后统一执行收藏保护与数量限制，确保最终订阅与预览一致
-            const mergedNodes = nodeArray.concat(customArray);
-            const selectedNodes = applyNodeLimit(mergedNodes, dynamicConfig);
-            let finalOutput = buildSubString(selectedNodes);
+            // 合并输出
+            let finalOutput = buildSubString(nodeArray);
+
+            if (customArray.length > 0) {
+                finalOutput += (finalOutput ? '\n' : '') + buildSubString(customArray);
+            }
 
             let base64Data;
 
@@ -386,7 +356,7 @@ export default {
 
 
 // ================= 核心工具函数：真实拉取远程节点 =================
-async function resolveLinksToNodes(text, request, userAgentHeader, report = null) {
+async function resolveLinksToNodes(text, request, userAgentHeader) {
     let urls = await ADD(text);
     let req_data = "";
     let selfBuilt = "";
@@ -414,7 +384,6 @@ async function resolveLinksToNodes(text, request, userAgentHeader, report = null
         );
 
         req_data += res[0].join('\n');
-        if (report) report.failures = res[2] || [];
     }
 
     return selfBuilt + (selfBuilt && req_data ? '\n' : '') + req_data;
@@ -612,35 +581,6 @@ function processNodes(content, config) {
 }
 
 
-// 稳定的伪随机排序：同一 UTC 日期内预览和订阅输出一致，次日自动重新抽样
-function stableNodeScore(value, seed) {
-    const input = String(seed) + '|' + String(value || '');
-    let hash = 2166136261;
-    for (let i = 0; i < input.length; i++) {
-        hash ^= input.charCodeAt(i);
-        hash = Math.imul(hash, 16777619);
-    }
-    return hash >>> 0;
-}
-
-function applyNodeLimit(nodes, config = {}) {
-    const list = Array.isArray(nodes) ? nodes : [];
-    const limit = Number(config.outputLimit || 0);
-    const favorites = new Set(Array.isArray(config.favorites) ? config.favorites : []);
-    if (!Number.isInteger(limit) || limit <= 0 || list.length <= limit) return list;
-
-    const protectedNodes = list.filter(node => node && favorites.has(node.identifier));
-    const ordinaryNodes = list.filter(node => !node || !favorites.has(node.identifier));
-    if (protectedNodes.length >= limit) return protectedNodes;
-
-    const seed = new Date().toISOString().slice(0, 10);
-    ordinaryNodes.sort((a, b) =>
-        stableNodeScore(a?.identifier || a?.raw, seed) - stableNodeScore(b?.identifier || b?.raw, seed)
-    );
-    return protectedNodes.concat(ordinaryNodes.slice(0, Math.max(0, limit - protectedNodes.length)));
-}
-
-
 // 数组反转为字符串订阅
 function buildSubString(nodeArray) {
     return nodeArray.map(n => {
@@ -745,6 +685,365 @@ function getCookie(request, name) {
 
     return null;
 }
+
+
+async function handleAdminUI(
+    request,
+    env,
+    sessionToken,
+    AdminUser,
+    AdminPass,
+    guest,
+    url,
+    mytoken,
+    FileName,
+    subProtocol,
+    subConverter,
+    subConfig,
+    userAgentHeader
+) {
+    const currentCookie = getCookie(request, 'admin_session');
+    const isAuthenticated = currentCookie === sessionToken;
+
+    if (url.pathname === '/') {
+        return Response.redirect(`${url.origin}/admin`, 302);
+    }
+
+    if (url.pathname === '/logout') {
+        return new Response(null, {
+            status: 302,
+            headers: {
+                'Location': '/login',
+                'Set-Cookie': `admin_session=; HttpOnly; Path=/; Max-Age=0`
+            }
+        });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/login') {
+        const formData = await request.formData();
+
+        if (
+            formData.get('username') === AdminUser &&
+            formData.get('password') === AdminPass
+        ) {
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    'Location': '/admin',
+                    'Set-Cookie': `admin_session=${sessionToken}; HttpOnly; Path=/; Max-Age=864000`
+                }
+            });
+        } else {
+            return new Response(renderLoginHTML(true), {
+                headers: { 'Content-Type': 'text/html;charset=utf-8' }
+            });
+        }
+    }
+
+    if (!isAuthenticated) {
+        return new Response(renderLoginHTML(), {
+            headers: { 'Content-Type': 'text/html;charset=utf-8' }
+        });
+    }
+
+    // 全局唯一保存接口
+    if (request.method === 'POST' && url.pathname === '/admin') {
+        if (!env.KV) {
+            return new Response("未绑定KV", { status: 400 });
+        }
+
+        const contentType = request.headers.get('content-type') || '';
+
+        if (contentType.includes('application/json')) {
+            try {
+                const textData = await request.text();
+                const data = JSON.parse(textData);
+
+                await env.KV.put('LINK.txt', data.links || '');
+                await env.KV.put('CUSTOM_NODES.txt', data.customNodes || '');
+                await env.KV.put('EDIT_CONFIG.json', JSON.stringify(data.config || {}));
+
+                return new Response("保存成功", { status: 200 });
+            } catch (e) {
+                return new Response("JSON 解析异常: " + e.message, { status: 400 });
+            }
+        } else {
+            const content = await request.text();
+            await env.KV.put('LINK.txt', content);
+            return new Response("保存成功", { status: 200 });
+        }
+    }
+
+    let content = '';
+    let customNodes = '';
+    let configObj = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG);
+    let hasKV = !!env.KV;
+
+    if (hasKV) {
+        content = await env.KV.get('LINK.txt') || '';
+        customNodes = await env.KV.get('CUSTOM_NODES.txt') || '';
+
+        let kvCfg = await env.KV.get('EDIT_CONFIG.json');
+
+        if (kvCfg) {
+            try {
+                Object.assign(configObj, JSON.parse(kvCfg));
+            } catch (e) {}
+        }
+    }
+
+    return new Response(
+        renderDashboardHTML(
+            content,
+            customNodes,
+            configObj,
+            guest,
+            url,
+            mytoken,
+            FileName,
+            hasKV,
+            subProtocol,
+            subConverter,
+            subConfig,
+            userAgentHeader
+        ),
+        {
+            headers: {
+                "Content-Type": "text/html;charset=utf-8",
+                "Cache-Control": "no-store, no-cache, must-revalidate"
+            }
+        }
+    );
+}
+
+
+const globalCSS = `
+<style>
+    :root {
+        --glass-bg: rgba(17, 25, 40, 0.6);
+        --glass-border: rgba(255, 255, 255, 0.125);
+        --neon-cyan: #00f3ff;
+        --neon-purple: #b026ff;
+    }
+
+    body {
+        background-color: #0f172a;
+        color: #e2e8f0;
+    }
+
+    .orb {
+        position: fixed;
+        border-radius: 50%;
+        filter: blur(100px);
+        opacity: 0.4;
+        z-index: -1;
+        animation: float 10s infinite ease-in-out alternate;
+    }
+
+    .orb-1 {
+        width: 400px;
+        height: 400px;
+        background: var(--neon-cyan);
+        top: -100px;
+        left: -100px;
+    }
+
+    .orb-2 {
+        width: 500px;
+        height: 500px;
+        background: var(--neon-purple);
+        bottom: -100px;
+        right: -100px;
+        animation-delay: -5s;
+    }
+
+    .orb-3 {
+        width: 300px;
+        height: 300px;
+        background: #ff0055;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        animation-delay: -2s;
+        opacity: 0.2;
+    }
+
+    @keyframes float {
+        0% { transform: translate(0, 0) scale(1); }
+        100% { transform: translate(30px, 50px) scale(1.1); }
+    }
+
+    .glass-card {
+        background-color: var(--glass-bg);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid var(--glass-border);
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+    }
+
+    .glass-input {
+        background: rgba(0, 0, 0, 0.2);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        color: #fff;
+        transition: all 0.3s;
+    }
+
+    .glass-input:focus {
+        border-color: var(--neon-cyan);
+        box-shadow: 0 0 15px rgba(0, 243, 255, 0.3);
+        outline: none;
+    }
+
+    .neon-text-cyan {
+        color: var(--neon-cyan);
+        text-shadow: 0 0 8px rgba(0, 243, 255, 0.5);
+    }
+
+    .neon-text-purple {
+        color: #d980ff;
+        text-shadow: 0 0 8px rgba(176, 38, 255, 0.5);
+    }
+
+    .neon-btn {
+        background: linear-gradient(45deg, #00f3ff, #0088ff);
+        color: #000;
+        box-shadow: 0 0 15px rgba(0, 243, 255, 0.4);
+        transition: all 0.3s;
+        border: none;
+    }
+
+    .neon-btn:hover {
+        box-shadow: 0 0 25px rgba(0, 243, 255, 0.7);
+        transform: translateY(-2px);
+    }
+
+    ::-webkit-scrollbar {
+        width: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+        background: rgba(0,0,0,0.1);
+    }
+
+    ::-webkit-scrollbar-thumb {
+        background: rgba(255,255,255,0.2);
+        border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+        background: rgba(255,255,255,0.4);
+    }
+</style>
+`;
+
+
+function renderLoginHTML(isError = false) {
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统后台登录</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    ${globalCSS}
+</head>
+<body class="h-screen flex items-center justify-center relative overflow-hidden">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+
+    <div class="glass-card p-10 rounded-3xl shadow-2xl w-96 relative z-10 border-t border-l border-white/20">
+        <div class="mb-8 text-center">
+            <h1 class="text-3xl font-bold text-white tracking-wider drop-shadow-md">
+                NODE<span class="neon-text-cyan"> HUB</span>
+            </h1>
+            <p class="text-sm text-gray-400 mt-2">安全聚合控制台</p>
+        </div>
+
+        ${isError ? '<div class="bg-red-500/20 border border-red-500/50 text-red-300 p-3 mb-6 text-sm rounded backdrop-blur-md">账号或密码错误，请重试</div>' : ''}
+
+        <form action="/login" method="POST" class="space-y-6">
+            <div>
+                <label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 用户名 </label>
+                <input type="text" name="username" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入用户名" required>
+            </div>
+
+            <div>
+                <label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 密码 </label>
+                <input type="password" name="password" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入密码" required>
+            </div>
+
+            <button type="submit" class="neon-btn w-full font-bold py-3 px-4 rounded-xl mt-4 uppercase tracking-widest text-sm">
+                授权登录 LOGIN
+            </button>
+        </form>
+    </div>
+</body>
+</html>`;
+}
+
+
+function renderDashboardHTML(
+    content,
+    customNodes,
+    configObj,
+    guest,
+    url,
+    mytoken,
+    FileName,
+    hasKV,
+    subProtocol,
+    subConverter,
+    subConfig,
+    userAgentHeader
+) {
+    const subItems = [
+        {
+            name: '自适应',
+            path: `/${mytoken}?sub`,
+            badge: 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+        },
+        {
+            name: 'Base64',
+            path: `/${mytoken}?b64`,
+            badge: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
+        },
+        {
+            name: 'Clash',
+            path: `/${mytoken}?clash`,
+            badge: 'bg-pink-500/20 text-pink-300 border-pink-500/30'
+        },
+        {
+            name: 'Singbox',
+            path: `/${mytoken}?sb`,
+            badge: 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+        }
+    ];
+
+    const generateSubCard = (item, prefix) => `
+        <div class="glass-card rounded-xl p-4 flex flex-col justify-between hover:border-[var(--neon-cyan)] hover:shadow-[0_0_15px_rgba(0,243,255,0.2)] transition-all duration-300 group cursor-pointer" onclick="copyTo('${url.origin}${item.path}')">
+            <div class="flex justify-between items-start mb-3">
+                <span class="px-2.5 py-1 text-[10px] font-bold rounded border ${item.badge} tracking-wider uppercase">${item.name}</span>
+                <span class="text-gray-500 group-hover:text-[var(--neon-cyan)] transition">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                    </svg>
+                </span>
+            </div>
+
+            <div class="flex flex-col items-center">
+                <div class="p-1.5 bg-white/90 rounded-lg shadow-sm group-hover:shadow-[0_0_10px_#fff] transition">
+                    <div id="${prefix}_${item.name}"></div>
+                </div>
+                <p class="text-[9px] text-gray-500 mt-3 truncate w-full text-center group-hover:text-gray-300 font-mono">
+                    ${url.origin}${item.path}
+                </p>
+            </div>
+        </div>
+    `;
+
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${FileName} - Node Editor Pro</title>
@@ -760,12 +1059,7 @@ function getCookie(request, name) {
 
     <script>
         // 前端保存独立状态
-        window.INITIAL_NODE_CONFIG = ${JSON.stringify(configObj)};
-        window.CURRENT_RETAIN_PROTOCOLS = ${JSON.stringify(configObj.retainProtocols || [])};
-        window.CURRENT_DROP_PROTOCOLS = ${JSON.stringify(configObj.dropProtocols || [])};
         window.CURRENT_SPECIFIC_RULES = ${JSON.stringify(configObj.specificRules || {})};
-        window.CURRENT_FAVORITES = ${JSON.stringify(Array.isArray(configObj.favorites) ? configObj.favorites : [])};
-        window.PREVIEW_NODES = [];
     </script>
 
     <nav class="glass-card sticky top-0 z-50 border-b-0 border-white/10 mb-8 rounded-b-3xl">
@@ -779,14 +1073,9 @@ function getCookie(request, name) {
                 <h1 class="font-bold text-xl text-white tracking-widest uppercase">${FileName}</h1>
             </div>
 
-            <div class="flex items-center gap-4 flex-wrap justify-end">
-                <div class="text-right font-mono text-[11px] leading-5 text-gray-300">
-                    <div>CN <span id="cnClock" class="text-cyan-300 tabular-nums">----</span></div>
-                    <div>UTC <span id="utcClock" class="text-purple-300 tabular-nums">----</span></div>
-                </div>
-                <button id="saveAllBtn" class="neon-btn px-4 py-2 rounded-xl text-xs font-bold">保存所有配置</button>
-                <a href="/logout" class="text-xs font-bold text-gray-400 hover:text-red-400 transition uppercase tracking-wider px-4 py-2 glass-card rounded-full hover:border-red-500/50">登出 LOGOUT</a>
-            </div>
+            <a href="/logout" class="text-xs font-bold text-gray-400 hover:text-red-400 transition uppercase tracking-wider px-4 py-2 glass-card rounded-full hover:border-red-500/50">
+                登出 LOGOUT
+            </a>
         </div>
     </nav>
 
@@ -803,16 +1092,32 @@ function getCookie(request, name) {
                         <p class="text-[11px] text-gray-400 mt-1 font-mono">填入需要合并抓取的节点或订阅源</p>
                     </div>
 
-                    <div class="flex items-center gap-2 flex-wrap justify-end">
-                        <span id="linksStatus" class="text-xs text-cyan-300"></span>
-                        <button type="button" data-module-save="links" class="module-save glass-card px-3 py-2 rounded-lg text-xs">保存配置</button>
-                        <button type="button" data-module-restore="links" class="glass-card px-3 py-2 rounded-lg text-xs">取消恢复</button>
-                        <button type="button" data-undo="links" class="glass-card px-3 py-2 rounded-lg text-xs">撤销</button>
-                        <button type="button" data-redo="links" class="glass-card px-3 py-2 rounded-lg text-xs">重做</button>
+                    <div class="flex items-center gap-3">
+                        <span id="saveStatus" class="text-xs text-[var(--neon-cyan)] font-mono mr-2"></span>
+
+                        <button
+                            id="restoreBtn"
+                            type="button"
+                            onclick="if (confirm('确定放弃当前所有未保存修改，并恢复到上次保存的整体配置吗？')) window.location.reload();"
+                            class="flex items-center justify-center h-10 px-4 gap-2 rounded-xl text-sm font-bold text-gray-300 border border-gray-600 hover:text-white hover:border-red-500/50 hover:bg-red-500/10 transition-all bg-black/20 cursor-pointer"
+                            title="放弃未保存的修改，重新读取 KV 中已保存的整体配置"
+                        >
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            取消恢复（整体配置）
+                        </button>
+
+                        <button id="saveBtn" class="neon-btn flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-black cursor-pointer shadow-[0_0_15px_rgba(0,243,255,0.4)]">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path>
+                            </svg>
+                            保存配置(最终生效)
+                        </button>
                     </div>
                 </div>
 
-                ${hasKV ? `<textarea id="content" data-module="links" class="glass-input w-full p-4 h-[120px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-green-400" placeholder="# 粘贴原始节点或订阅链接...">${content}</textarea><div class="mt-3 flex justify-end"><button id="sourcePreviewBtn" class="glass-card px-4 py-2 rounded-lg text-xs text-cyan-300">节点抓取源预览</button></div>` : '<div class="h-[100px] flex items-center justify-center bg-red-900/20 text-red-400 font-medium rounded-xl">未绑定 KV，功能不可用</div>'}
+                ${hasKV ? `<textarea id="content" class="glass-input w-full p-4 h-[120px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-green-400" placeholder="# 粘贴原始节点或订阅链接...">${content}</textarea>` : '<div class="h-[100px] flex items-center justify-center bg-red-900/20 text-red-400 font-medium rounded-xl">未绑定 KV，功能不可用</div>'}
             </div>
 
             ${hasKV ? `
@@ -829,88 +1134,76 @@ function getCookie(request, name) {
                     </button>
                 </div>
 
-                <div class="flex flex-wrap gap-2 justify-end mb-4">
-                    <span id="rulesStatus" class="text-xs text-cyan-300 mr-auto"></span>
-                    <button type="button" data-module-save="rules" class="module-save glass-card px-3 py-2 rounded-lg text-xs">保存配置</button>
-                    <button type="button" data-module-restore="rules" class="glass-card px-3 py-2 rounded-lg text-xs">取消恢复</button>
-                    <button type="button" data-undo="rules" class="glass-card px-3 py-2 rounded-lg text-xs">撤销</button>
-                    <button type="button" data-redo="rules" class="glass-card px-3 py-2 rounded-lg text-xs">重做</button>
-                </div>
                 <div class="grid grid-cols-2 gap-4 mb-5 pb-2">
                     <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_autoEmoji" data-module="rules" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.autoEmoji ? 'checked' : ''}>
+                        <input type="checkbox" id="cfg_autoEmoji" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.autoEmoji ? 'checked' : ''}>
                         <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">自动地区 Emoji (🇭🇰🇯🇵)</span>
                     </label>
 
                     <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_deepDeduplicate" data-module="rules" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.deepDeduplicate ? 'checked' : ''}>
+                        <input type="checkbox" id="cfg_deepDeduplicate" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.deepDeduplicate ? 'checked' : ''}>
                         <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">深度去重 (剔同IP端口)</span>
                     </label>
 
                     <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_sortNodes" data-module="rules" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.sortNodes ? 'checked' : ''}>
+                        <input type="checkbox" id="cfg_sortNodes" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.sortNodes ? 'checked' : ''}>
                         <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">智能排序 (信息置顶)</span>
                     </label>
 
                     <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_dropInvalidNodes" data-module="rules" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.dropInvalidNodes ? 'checked' : ''}>
+                        <input type="checkbox" id="cfg_dropInvalidNodes" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.dropInvalidNodes ? 'checked' : ''}>
                         <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">剔除无效节点(防报错)</span>
                     </label>
                 </div>
 
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div class="md:col-span-2">
-                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">查找关键字（仅筛选预览显示）</label>
-                        <input type="text" id="ruleFindKeyword" class="glass-input w-full p-2 text-xs rounded-lg" placeholder="输入要查找的节点名称关键词">
-                    </div>
-                    <div class="md:col-span-2">
-                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">替换目标关键字</label>
-                        <input type="text" id="cfg_replaceTarget" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceTarget || ''}" placeholder="例: @clashV8">
+                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">查找关键字 (在下方预览中将高亮展示被删内容)</label>
+                        <input type="text" id="cfg_replaceTarget" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceTarget || ''}" placeholder="例: @clashV8">
                     </div>
 
                     <div class="md:col-span-2">
                         <label class="text-[10px] text-[var(--neon-purple)] block mb-1">替换为 (留空则代表直接删除查找到的词)</label>
-                        <input type="text" id="cfg_replaceWith" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceWith || ''}" placeholder="例: 星链">
+                        <input type="text" id="cfg_replaceWith" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceWith || ''}" placeholder="例: 星链">
                     </div>
 
                     <div>
                         <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则保留(名称)</label>
-                        <input type="text" id="cfg_retainNameRegex" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.retainNameRegex || ''}" placeholder="如：香港|日本">
+                        <input type="text" id="cfg_retainNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.retainNameRegex || ''}" placeholder="如：香港|日本">
                     </div>
 
                     <div>
                         <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则剔除(名称)</label>
-                        <input type="text" id="cfg_dropNameRegex" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.dropNameRegex || ''}" placeholder="如：过期|流量">
+                        <input type="text" id="cfg_dropNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.dropNameRegex || ''}" placeholder="如：过期|流量">
                     </div>
 
                     <div>
                         <label class="text-[10px] text-gray-400 block mb-1 mt-2">全局重命名(覆盖)</label>
-                        <input type="text" id="cfg_globalRename" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.globalRename || ''}" placeholder="如：专属节点">
+                        <input type="text" id="cfg_globalRename" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.globalRename || ''}" placeholder="如：专属节点">
                     </div>
 
                     <div class="flex gap-2">
                         <div class="w-1/2">
                             <label class="text-[10px] text-gray-400 block mb-1 mt-2">统一前缀</label>
-                            <input type="text" id="cfg_addPrefix" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addPrefix || ''}" placeholder="如：🚀">
+                            <input type="text" id="cfg_addPrefix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addPrefix || ''}" placeholder="如：🚀">
                         </div>
 
                         <div class="w-1/2">
                             <label class="text-[10px] text-gray-400 block mb-1 mt-2">统一后缀</label>
-                            <input type="text" id="cfg_addSuffix" data-module="rules" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
+                            <input type="text" id="cfg_addSuffix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
                         </div>
                     </div>
                 </div>
-                <div class="flex flex-wrap gap-2 mt-4">
-                    <button type="button" id="findKeywordBtn" class="glass-card px-3 py-2 rounded-lg text-xs">查找</button>
-                    <button type="button" id="replaceKeywordBtn" class="glass-card px-3 py-2 rounded-lg text-xs">替换</button>
-                    <button type="button" id="retainRegexBtn" class="glass-card px-3 py-2 rounded-lg text-xs">执行保留</button>
-                    <button type="button" id="dropRegexBtn" class="glass-card px-3 py-2 rounded-lg text-xs">执行剔除</button>
-                    <button type="button" id="renameBtn" class="glass-card px-3 py-2 rounded-lg text-xs">执行重命名</button>
-                    <button type="button" id="prefixBtn" class="glass-card px-3 py-2 rounded-lg text-xs">添加前缀</button>
-                    <button type="button" id="suffixBtn" class="glass-card px-3 py-2 rounded-lg text-xs">添加后缀</button>
-                </div>
             </div>
-                        <!-- 3. 实时节点预览区域 -->
+
+            <!-- 3. 自定义节点 -->
+            <div class="glass-card rounded-2xl p-6 flex flex-col">
+                <h2 class="text-lg font-bold text-pink-400 mb-1 tracking-wide">自定义输出节点 (Custom Output)</h2>
+                <p class="text-[11px] text-gray-400 mb-4 font-mono">在此填写的节点将<strong class="text-white">不受上方规则限制</strong>，强制追加到订阅末尾</p>
+                <textarea id="customNodes" class="glass-input w-full p-4 h-[80px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴自建节点...">${customNodes}</textarea>
+            </div>
+
+            <!-- 4. 实时节点预览区域 -->
             <div id="previewSection" class="glass-card rounded-2xl p-6 hidden flex-col border border-[var(--neon-cyan)] shadow-[0_0_20px_rgba(0,243,255,0.15)] mt-2">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-lg font-bold text-[var(--neon-cyan)] tracking-wide flex items-center gap-2">
@@ -924,19 +1217,6 @@ function getCookie(request, name) {
                     <button onclick="document.getElementById('previewSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xs border border-gray-600 px-3 py-1 rounded-full hover:bg-white/10 transition">
                         ✕ 关闭
                     </button>
-                </div>
-
-                <div class="flex flex-wrap items-center gap-2 mb-4">
-                    <span id="previewStatus" class="text-xs text-cyan-300 mr-auto"></span>
-                    <button type="button" data-module-save="preview" class="module-save glass-card px-3 py-2 rounded-lg text-xs">保存配置</button>
-                    <button type="button" data-module-restore="preview" class="glass-card px-3 py-2 rounded-lg text-xs">取消恢复</button>
-                    <button type="button" data-undo="preview" class="glass-card px-3 py-2 rounded-lg text-xs">撤销</button>
-                    <button type="button" data-redo="preview" class="glass-card px-3 py-2 rounded-lg text-xs">重做</button>
-                </div>
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4 p-3 rounded-xl bg-black/30 border border-white/10">
-                    <label class="text-xs text-gray-300">最终输出节点数量（0=不限制）<input id="outputLimit" data-module="preview" type="number" min="0" max="10000" step="1" value="${Number(configObj.outputLimit || 0)}" class="glass-input w-full mt-1 p-2 rounded-lg"></label>
-                    <label class="text-xs text-gray-300 md:col-span-2">预览查找（只隐藏显示，不删除节点）<input id="previewSearch" type="text" class="glass-input w-full mt-1 p-2 rounded-lg" placeholder="输入节点名称关键字"></label>
-                    <div class="md:col-span-3 text-xs text-gray-400" id="nodeStats">等待抓取节点</div>
                 </div>
 
                 <!-- 批量指定前缀后缀工具栏 -->
@@ -957,23 +1237,6 @@ function getCookie(request, name) {
                 <div id="previewContent" class="w-full h-[400px] rounded-xl overflow-y-auto pr-2 custom-scrollbar"></div>
             </div>
 
-
-            <!-- 4. 自定义节点 -->
-            <div class="glass-card rounded-2xl p-6 flex flex-col">
-                <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
-                    <h2 class="text-lg font-bold text-pink-400 tracking-wide">自定义输出节点 (Custom Output)</h2>
-                    <div class="flex gap-2 items-center"><span id="customStatus" class="text-xs text-cyan-300"></span>
-                        <button type="button" data-module-save="custom" class="module-save glass-card px-3 py-2 rounded-lg text-xs">保存配置</button>
-                        <button type="button" data-module-restore="custom" class="glass-card px-3 py-2 rounded-lg text-xs">取消恢复</button>
-                        <button type="button" data-undo="custom" class="glass-card px-3 py-2 rounded-lg text-xs">撤销</button>
-                        <button type="button" data-redo="custom" class="glass-card px-3 py-2 rounded-lg text-xs">重做</button>
-                    </div>
-                </div>
-                <p class="text-[11px] text-gray-400 mb-4 font-mono">在此填写的节点独立管理，不执行普通 Rules 过滤，参与最终数量控制</p>
-                <textarea id="customNodes" data-module="custom" class="glass-input w-full p-4 h-[100px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴自建节点...">${customNodes}</textarea>
-                <div class="flex justify-end mt-3"><button type="button" id="customPreviewBtn" class="glass-card px-4 py-2 rounded-lg text-xs text-pink-300">预览自定义节点</button></div>
-                <div id="customPreviewContent" class="hidden mt-3 max-h-48 overflow-y-auto rounded-lg border border-pink-400/20 bg-black/30 p-3 text-xs text-gray-300"></div>
-            </div>
             ` : ''}
         </div>
 
@@ -981,11 +1244,10 @@ function getCookie(request, name) {
         <div class="lg:col-span-5 flex flex-col gap-6">
             <div class="glass-card rounded-2xl p-6 relative overflow-hidden">
                 <div class="absolute -top-10 -right-10 w-32 h-32 bg-[var(--neon-cyan)] rounded-full mix-blend-screen filter blur-[60px] opacity-20 pointer-events-none"></div>
-                <div class="flex justify-between items-center cursor-pointer" onclick="toggleMySubs()"><h2 class="text-lg font-bold text-white mb-1 tracking-wide">专属地址 My Subs</h2><span id="mySubsToggle" class="text-xs text-gray-400">收起 ▲</span></div>
-                <div id="mySubsContent">
+                <h2 class="text-lg font-bold text-white mb-1 tracking-wide">专属地址 My Subs</h2>
+
                 <div class="grid grid-cols-2 gap-4 mt-5">
                     ${subItems.map(item => generateSubCard(item, 'qr_my')).join('')}
-                </div>
                 </div>
             </div>
 
@@ -1073,7 +1335,9 @@ function getCookie(request, name) {
                 return line;
             }).join('\\n');
         }
-                window.onload = () => {
+
+
+        window.onload = () => {
             ${subItems.map(item => `
                 if(document.getElementById('qr_my_${item.name}')) new QRCode(document.getElementById('qr_my_${item.name}'), {
                     text: '${url.origin}${item.path}',
@@ -1165,24 +1429,11 @@ function getCookie(request, name) {
                         ? document.getElementById('cfg_replaceWith').value
                         : '',
 
-                    retainProtocols: window.CURRENT_RETAIN_PROTOCOLS || [],
-                    dropProtocols: window.CURRENT_DROP_PROTOCOLS || [],
-                    specificRules: window.CURRENT_SPECIFIC_RULES,
-                    outputLimit: document.getElementById('outputLimit') ? Number(document.getElementById('outputLimit').value || 0) : 0,
-                    favorites: Array.isArray(window.CURRENT_FAVORITES) ? window.CURRENT_FAVORITES : []
+                    specificRules: window.CURRENT_SPECIFIC_RULES
                 }
             };
         }
 
-
-        function applyPreviewSearch() {
-            const keyword = (document.getElementById('previewSearch')?.value || '').toLowerCase();
-            document.querySelectorAll('.preview-node').forEach(el => { el.style.display = (el.dataset.nodeName || '').toLowerCase().includes(keyword) ? '' : 'none'; });
-            const visible = document.querySelectorAll('.preview-node:not([style*="display: none"])').length;
-            const stat = document.getElementById('nodeStats');
-            if (stat) stat.dataset.visible = String(visible);
-        }
-        document.getElementById('previewSearch')?.addEventListener('input', applyPreviewSearch);
 
         // ================= 前端核心：请求真实预览 =================
         const previewBtn = document.getElementById('previewBtn');
@@ -1235,14 +1486,13 @@ function getCookie(request, name) {
                     const renderList = (nodesArr, isCustom) => {
                         nodesArr.forEach((node, index) => {
                             if (!node.valid) return;
-                            const nodeIsCustom = !!(node.isCustom || isCustom);
 
                             let origDisplay = highlight(node.originalName, targetKw, true);
                             let finalDisplay = highlight(node.name, payload.config.replaceWith, false);
 
                             let diffHtml = '';
 
-                            if (node.originalName !== node.name && !nodeIsCustom) {
+                            if (node.originalName !== node.name && !isCustom) {
                                 diffHtml = \`<div class="text-[11px] text-gray-500 line-through mb-1 flex items-center gap-2">
                                     <svg class="w-3 h-3 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
@@ -1258,17 +1508,16 @@ function getCookie(request, name) {
                                 : 'border-white/10 hover:border-white/30 bg-black/50';
 
                             htmlContent += \`
-                                <li data-node-name="\${String(node.name || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;')}" class="preview-node p-3 rounded-xl border \${borderClass} transition-all duration-300 flex items-start gap-3 relative overflow-hidden group">
-                                    \${!nodeIsCustom ? \`<input type="checkbox" class="node-checkbox form-checkbox h-4 w-4 mt-1.5 text-[var(--neon-cyan)] rounded border-gray-600 bg-black cursor-pointer" value="\${node.identifier}">\` : '<span class="w-4"></span>'}
+                                <li class="p-3 rounded-xl border \${borderClass} transition-all duration-300 flex items-start gap-3 relative overflow-hidden group">
+                                    \${!isCustom ? \`<input type="checkbox" class="node-checkbox form-checkbox h-4 w-4 mt-1.5 text-[var(--neon-cyan)] rounded border-gray-600 bg-black cursor-pointer" value="\${node.identifier}">\` : '<span class="w-4"></span>'}
 
                                     <div class="flex-1 min-w-0">
                                         <div class="flex items-center gap-2 mb-1.5">
                                             <span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-700/80 text-gray-300 border border-gray-600 uppercase tracking-wider">
                                                 \${node.protocol}
                                             </span>
-                                            <button type="button" class="favorite-toggle text-xs px-2 py-0.5 rounded border border-yellow-400/30 text-yellow-300" data-favorite-id="\${node.identifier}">\${window.CURRENT_FAVORITES.includes(node.identifier) ? '★ 已收藏' : '☆ 收藏'}</button>
 
-                                            \${nodeIsCustom ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-400 border border-pink-500/30">自定义输出</span>' : ''}
+                                            \${isCustom ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-400 border border-pink-500/30">自定义输出</span>' : ''}
 
                                             \${hasRule ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-500/20 text-[var(--neon-purple)] border border-[var(--neon-purple)]/50">存在专属附加规则</span>' : ''}
                                         </div>
@@ -1301,20 +1550,6 @@ function getCookie(request, name) {
                     htmlContent += '</ul>';
 
                     document.getElementById('previewContent').innerHTML = htmlContent;
-                    window.PREVIEW_NODES = (resJson.nodes || []).concat(resJson.customNodes || []);
-                    const stat = document.getElementById('nodeStats');
-                    if (stat) { stat.title = (resJson.failures || []).map(x => x.url + '：' + x.error).join('\\n'); stat.textContent = \`可用节点 \${resJson.totalNodes ?? window.PREVIEW_NODES.length} · 当前输出 \${resJson.outputNodes ?? window.PREVIEW_NODES.length} · 收藏 \${resJson.favoriteCount ?? window.CURRENT_FAVORITES.length} · 数量上限 \${resJson.outputLimit || '不限'}\` + ((resJson.failures || []).length ? \` · 失败订阅 \${(resJson.failures || []).length}（悬停查看原因）\` : ''); }
-                    if ((resJson.failures || []).length) showToast('有 '+resJson.failures.length+' 个订阅源抓取失败，详情见节点统计区域', 'error');
-                    if ((resJson.unmatchedFavorites || []).length) showToast('有 '+resJson.unmatchedFavorites.length+' 个收藏节点暂未匹配到，请检查订阅源或节点是否变更', 'error');
-                    document.querySelectorAll('.favorite-toggle').forEach(button => button.addEventListener('click', () => {
-                        const id = button.dataset.favoriteId;
-                        if (window.CURRENT_FAVORITES.includes(id)) window.CURRENT_FAVORITES = window.CURRENT_FAVORITES.filter(x => x !== id);
-                        else window.CURRENT_FAVORITES.push(id);
-                        rememberModule('preview');
-                        button.textContent = window.CURRENT_FAVORITES.includes(id) ? '★ 已收藏' : '☆ 收藏';
-                        if (document.getElementById('previewBtn')) document.getElementById('previewBtn').click();
-                    }));
-                    applyPreviewSearch();
 
                     // 绑定选中框事件
                     document.querySelectorAll('.node-checkbox').forEach(cb => {
@@ -1342,7 +1577,9 @@ function getCookie(request, name) {
                 }
             };
         }
-                // ================= 前端核心：专有规则附加 =================
+
+
+        // ================= 前端核心：专有规则附加 =================
         const applyBatchBtn = document.getElementById('applyBatchBtn');
 
         if (applyBatchBtn) {
@@ -1354,7 +1591,6 @@ function getCookie(request, name) {
                     return;
                 }
 
-                rememberModule('rules');
                 const p = document.getElementById('batchPrefix').value;
                 const s = document.getElementById('batchSuffix').value;
 
@@ -1391,7 +1627,6 @@ function getCookie(request, name) {
 
         if (clearBatchBtn) {
             clearBatchBtn.onclick = () => {
-                rememberModule('rules');
                 window.CURRENT_SPECIFIC_RULES = {};
                 showToast('已清空所有专属前后缀规则！');
 
@@ -1402,147 +1637,59 @@ function getCookie(request, name) {
         }
 
 
-        // 模块暂存、撤销/重做与全局正式保存严格分离
-        const moduleFields = {
-            links: ['content'],
-            rules: ['cfg_autoEmoji','cfg_deepDeduplicate','cfg_sortNodes','cfg_dropInvalidNodes','cfg_replaceTarget','cfg_replaceWith','cfg_retainNameRegex','cfg_dropNameRegex','cfg_globalRename','cfg_addPrefix','cfg_addSuffix'],
-            preview: ['outputLimit'],
-            custom: ['customNodes']
-        };
-        const moduleState = {};
-        const moduleHistory = {};
-        const clone = value => JSON.parse(JSON.stringify(value));
-        function readModule(id) {
-            const state = {};
-            (moduleFields[id] || []).forEach(key => { const el = document.getElementById(key); if (el) state[key] = el.type === 'checkbox' ? el.checked : el.value; });
-            if (id === 'rules') state.specificRules = clone(window.CURRENT_SPECIFIC_RULES || {});
-            if (id === 'preview') state.favorites = clone(window.CURRENT_FAVORITES || []);
-            return state;
-        }
-        function applyModule(id, state) {
-            if (!state) return;
-            Object.entries(state).forEach(([key,value]) => {
-                if (key === 'specificRules') { window.CURRENT_SPECIFIC_RULES = clone(value || {}); return; }
-                if (key === 'favorites') { window.CURRENT_FAVORITES = clone(value || []); return; }
-                const el = document.getElementById(key); if (el) { if (el.type === 'checkbox') el.checked = !!value; else el.value = value ?? ''; }
+        // 全局唯一保存机制
+        const btn = document.getElementById('saveBtn');
+
+        if (btn) {
+            const setUnsavedStatus = () => {
+                document.getElementById('saveStatus').innerHTML =
+                    '<span class="text-yellow-400 drop-shadow-[0_0_5px_rgba(250,204,21,0.5)]">⚠️ 尚未保存生效</span>';
+            };
+
+            const saveAction = async () => {
+                btn.innerHTML = '⏳ 写入底层 KV 中...';
+                btn.disabled = true;
+                btn.style.filter = "brightness(0.7)";
+
+                try {
+                    const payload = getPayload();
+
+                    document.getElementById('content').value = payload.links;
+                    document.getElementById('customNodes').value = payload.customNodes;
+
+                    const res = await fetch('/admin', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (res.ok) {
+                        document.getElementById('saveStatus').innerHTML =
+                            '<span class="text-[var(--neon-cyan)]">✓ 保存于 ' +
+                            new Date().toLocaleTimeString() +
+                            '</span>';
+
+                        showToast('配置数据已安全存入底层 KV！已对外部订阅链接完全生效。');
+                    } else {
+                        showToast('保存失败，请检查网络', 'error');
+                    }
+
+                } catch (e) {
+                    showToast('网络异常', 'error');
+                } finally {
+                    btn.innerHTML = '<svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> 保存配置(最终生效>';
+                    btn.disabled = false;
+                    btn.style.filter = "brightness(1)";
+                }
+            };
+
+            btn.onclick = saveAction;
+
+            document.querySelectorAll('input, textarea').forEach(el => {
+                el.addEventListener('input', setUnsavedStatus);
             });
         }
-        function rememberModule(id) {
-            const current = readModule(id);
-            const h = moduleHistory[id];
-            if (JSON.stringify(h.items[h.index]) === JSON.stringify(current)) return;
-            h.items = h.items.slice(0, h.index + 1); h.items.push(clone(current));
-            if (h.items.length > 11) h.items.shift();
-            h.index = h.items.length - 1; updateHistoryButtons(id);
-        }
-        function updateHistoryButtons(id) {
-            const h = moduleHistory[id];
-            document.querySelectorAll(\`[data-undo="\${id}"]\`).forEach(b => b.disabled = !h || h.index <= 0);
-            document.querySelectorAll(\`[data-redo="\${id}"]\`).forEach(b => b.disabled = !h || h.index >= h.items.length - 1);
-        }
-        const staged = { links: document.getElementById('content')?.value || '', customNodes: document.getElementById('customNodes')?.value || '', config: getPayload().config };
-        ['links','rules','preview','custom'].forEach(id => { const initial = readModule(id); moduleState[id] = clone(initial); moduleHistory[id] = {items:[clone(initial)],index:0}; updateHistoryButtons(id); });
-        document.querySelectorAll('[data-module]').forEach(el => {
-            const id = el.dataset.module;
-            el.addEventListener('input', () => { const status=document.getElementById(id+'Status'); if(status) status.textContent='有未暂存修改'; clearTimeout(el._historyTimer); el._historyTimer = setTimeout(() => rememberModule(id), 250); });
-            el.addEventListener('change', () => { const status=document.getElementById(id+'Status'); if(status) status.textContent='有未暂存修改'; rememberModule(id); });
-        });
-        document.querySelectorAll('[data-module-save]').forEach(button => button.addEventListener('click', () => {
-            const id = button.dataset.moduleSave; rememberModule(id); moduleState[id] = readModule(id);
-            if (id === 'links') staged.links = moduleState[id].content;
-            if (id === 'custom') staged.customNodes = moduleState[id].customNodes;
-            if (id === 'rules') { const current = getPayload().config; ['autoEmoji','deepDeduplicate','sortNodes','dropInvalidNodes','globalRename','addPrefix','addSuffix','retainNameRegex','dropNameRegex','replaceTarget','replaceWith','specificRules'].forEach(k => staged.config[k] = current[k]); }
-            if (id === 'preview') { staged.config.outputLimit = Number(moduleState[id].outputLimit || 0); staged.config.favorites = clone(moduleState[id].favorites || []); }
-            const status = document.getElementById(id + 'Status'); if (status) status.textContent = '已暂存，等待全局保存';
-            showToast('本模块已暂存，点击「保存所有配置」后才会正式生效');
-        }));
-        document.querySelectorAll('[data-module-restore]').forEach(button => button.addEventListener('click', () => {
-            const id = button.dataset.moduleRestore; applyModule(id, moduleState[id]);
-            rememberModule(id); showToast('已恢复本模块最近一次暂存状态');
-        }));
-        document.querySelectorAll('[data-undo]').forEach(button => button.addEventListener('click', () => {
-            const id = button.dataset.undo, h = moduleHistory[id]; if (h.index <= 0) return;
-            h.index--; applyModule(id, h.items[h.index]); updateHistoryButtons(id);
-        }));
-        document.querySelectorAll('[data-redo]').forEach(button => button.addEventListener('click', () => {
-            const id = button.dataset.redo, h = moduleHistory[id]; if (h.index >= h.items.length - 1) return;
-            h.index++; applyModule(id, h.items[h.index]); updateHistoryButtons(id);
-        }));
-                // 显式规则按钮：点击才执行；规则值仍由服务端处理引擎执行
-        document.getElementById('findKeywordBtn')?.addEventListener('click', () => {
-            const input = document.getElementById('ruleFindKeyword');
-            const search = document.getElementById('previewSearch'); if (search) search.value = input.value;
-            document.getElementById('previewSection')?.classList.remove('hidden');
-            document.getElementById('previewBtn')?.click();
-            showToast('查找仅过滤预览显示，不会删除节点');
-        });
-        document.getElementById('replaceKeywordBtn')?.addEventListener('click', () => { rememberModule('rules'); document.getElementById('previewBtn')?.click(); });
-        document.getElementById('retainRegexBtn')?.addEventListener('click', () => { try { const v=document.getElementById('cfg_retainNameRegex').value; if(v) new RegExp(v,'i'); rememberModule('rules'); document.getElementById('previewBtn')?.click(); } catch(e) { showToast('正则保留表达式错误：'+e.message,'error'); } });
-        document.getElementById('dropRegexBtn')?.addEventListener('click', () => { try { const v=document.getElementById('cfg_dropNameRegex').value; if(v) new RegExp(v,'i'); rememberModule('rules'); document.getElementById('previewBtn')?.click(); } catch(e) { showToast('正则剔除表达式错误：'+e.message,'error'); } });
-        document.getElementById('renameBtn')?.addEventListener('click', () => { rememberModule('rules'); document.getElementById('previewBtn')?.click(); });
-        document.getElementById('prefixBtn')?.addEventListener('click', () => { rememberModule('rules'); document.getElementById('previewBtn')?.click(); });
-        document.getElementById('suffixBtn')?.addEventListener('click', () => { rememberModule('rules'); document.getElementById('previewBtn')?.click(); });
-        document.getElementById('sourcePreviewBtn')?.addEventListener('click', () => document.getElementById('previewBtn')?.click());
-        document.getElementById('customPreviewBtn')?.addEventListener('click', async () => {
-            const button = document.getElementById('customPreviewBtn');
-            const panel = document.getElementById('customPreviewContent');
-            button.disabled = true; button.textContent = '解析中…';
-            try {
-                const response = await fetch('/preview', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(getPayload())});
-                const data = await response.json(); if (!response.ok) throw new Error(data.error || '预览失败');
-                const custom = (data.nodes || []).filter(node => node.isCustom && node.valid);
-                panel.textContent = custom.length ? custom.map((node,i) => \`\${i+1}. \${node.name} [\${node.protocol}]\`).join('\\n') : '暂无有效自定义节点';
-                panel.classList.remove('hidden');
-            } catch(e) { showToast('自定义节点预览失败：'+e.message,'error'); }
-            finally { button.disabled=false; button.textContent='预览自定义节点'; }
-        });
 
-        // 全局提交只提交各模块已暂存的内容；未暂存编辑不会偷偷写入 KV
-        const saveAllBtn = document.getElementById('saveAllBtn');
-        if (saveAllBtn) saveAllBtn.addEventListener('click', async () => {
-            saveAllBtn.disabled = true; saveAllBtn.textContent = '正在提交…';
-            try {
-                const payload = { links: staged.links, customNodes: staged.customNodes, config: clone(staged.config) };
-                const res = await fetch('/admin', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-                const result = await res.json();
-                if (!res.ok || !result.success) throw new Error(result.error || '保存失败');
-                applyModule('links', {content: staged.links});
-                applyModule('custom', {customNodes: staged.customNodes});
-                const stagedRules = {
-                    cfg_autoEmoji: staged.config.autoEmoji, cfg_deepDeduplicate: staged.config.deepDeduplicate,
-                    cfg_sortNodes: staged.config.sortNodes, cfg_dropInvalidNodes: staged.config.dropInvalidNodes,
-                    cfg_replaceTarget: staged.config.replaceTarget || '', cfg_replaceWith: staged.config.replaceWith || '',
-                    cfg_retainNameRegex: staged.config.retainNameRegex || '', cfg_dropNameRegex: staged.config.dropNameRegex || '',
-                    cfg_globalRename: staged.config.globalRename || '', cfg_addPrefix: staged.config.addPrefix || '',
-                    cfg_addSuffix: staged.config.addSuffix || '', specificRules: staged.config.specificRules || {}
-                };
-                applyModule('rules', stagedRules);
-                applyModule('preview', {outputLimit: staged.config.outputLimit || 0, favorites: staged.config.favorites || []});
-                ['links','rules','preview','custom'].forEach(id => {
-                    moduleState[id] = readModule(id);
-                    const h = moduleHistory[id]; h.items = [clone(moduleState[id])]; h.index = 0; updateHistoryButtons(id);
-                    const status = document.getElementById(id+'Status'); if(status) status.textContent = '全局已生效';
-                });
-                const saveStatus = document.getElementById('linksStatus');
-                if (saveStatus) saveStatus.textContent = '全局保存成功 ' + new Date(result.savedAt).toLocaleTimeString('zh-CN',{hour12:false});
-                showToast(result.compatibilityMirrorWarning ? '统一配置已生效；旧键兼容镜像有部分写入失败' : '全部配置已正式保存并生效');
-            } catch(e) { showToast('全局保存失败：'+e.message,'error'); }
-            finally { saveAllBtn.disabled=false; saveAllBtn.textContent='保存所有配置'; }
-        });
-
-        // CN / UTC 使用同一个时间戳，每秒刷新
-        function updateClocks() {
-            const now = new Date();
-            const fmt = zone => new Intl.DateTimeFormat('sv-SE', {timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(now);
-            const cn = document.getElementById('cnClock'), utc = document.getElementById('utcClock');
-            if (cn) cn.textContent = fmt('Asia/Shanghai'); if (utc) utc.textContent = fmt('UTC');
-        }
-        updateClocks(); setInterval(updateClocks,1000);
-
-        function toggleMySubs() {
-            const el=document.getElementById('mySubsContent'), btn=document.getElementById('mySubsToggle');
-            el.classList.toggle('hidden'); btn.textContent=el.classList.contains('hidden')?'展开 ▼':'收起 ▲';
-        }
 
         function toggleNotice() {
             const el = document.getElementById('noticeContent');
@@ -1573,6 +1720,8 @@ function getCookie(request, name) {
 </body>
 </html>`;
 }
+
+
 // 基础编解码函数
 async function ADD(envadd) {
     var addtext = envadd
@@ -1706,7 +1855,7 @@ async function getUrl(
 
     // 【修复 1】：取消透传前端的 Accept，防止目标 API 返回 JSON 数据导致后续无法解析 Base64
     newHeaders.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain,application/x-envoy,*/*;q=0.8');
-
+    
     // 【修复 2】：移除浏览器 UA 中的 Mozilla 标识，防止被订阅防DDoS面板识别为浏览器而返回网页
     newHeaders.set(
         'User-Agent',
@@ -1734,13 +1883,12 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
         : [];
 
     if (sources.length === 0) {
-        return [[], '', []];
+        return [[], ''];
     }
 
     let newapi = '';
     let 异常订阅 = '';
     let 订阅转换URLs = '';
-    const failures = [];
 
     const controller = new AbortController();
 
@@ -1768,9 +1916,11 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
 
         responses.forEach((response, index) => {
             if (response.status !== 'fulfilled') {
-                const reason = response.reason?.message || String(response.reason || '未知错误');
-                failures.push({ url: sources[index], error: reason });
-                console.warn('订阅源抓取失败:', sources[index], reason);
+                console.warn(
+                    '订阅源抓取失败:',
+                    sources[index],
+                    response.reason?.message || response.reason
+                );
                 return;
             }
 
@@ -1829,7 +1979,6 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
 
     return [
         await ADD(newapi + 异常订阅),
-        订阅转换URLs,
-        failures
+        订阅转换URLs
     ];
 }
