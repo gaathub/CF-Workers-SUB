@@ -617,12 +617,25 @@ function parseSingleNode(line) {
                 raw: line
             };
         } else {
-            let urlObj = new URL(line);
+            // 规避 V8 引擎对于非标准协议 (vless/trojan/ss 等) 丢失 host/port 的 URL 解析 bug
+            let match = line.match(/^([a-zA-Z0-9+-.]+):\/\/(.*)$/);
+            if (!match) return node;
+
+            let proto = match[1];
+            let rest = match[2];
+            let urlObj;
+            try {
+                // 借用 http 协议强制 V8 正确解析出 hostname 和 port
+                urlObj = new URL(`http://${rest}`);
+            } catch (e) {
+                urlObj = new URL(line); // 降级处理
+            }
+
             let name = decodeURIComponent(urlObj.hash.slice(1) || '');
 
             node = {
                 valid: !!urlObj.hostname && !!urlObj.port,
-                protocol: urlObj.protocol.replace(':', ''),
+                protocol: proto.toLowerCase(),
                 name: name,
                 originalName: name,
                 address: urlObj.hostname,
@@ -651,7 +664,9 @@ function rebuildSingleNode(node) {
     } else {
         let urlObj = node.urlObj;
         urlObj.hash = '#' + encodeURIComponent(node.name);
-        return urlObj.toString();
+        // 重新将 http:// 还原为原始的节点协议（如 vless://）
+        let out = urlObj.toString();
+        return out.replace(/^http:/i, node.protocol + ':');
     }
 }
 
@@ -1838,15 +1853,13 @@ async function getUrl(
     // 不转发后台 Cookie / Authorization，避免管理凭据泄露给第三方订阅地址。
     const newHeaders = new Headers();
 
-    const accept = request?.headers?.get('Accept');
-
-    if (accept) {
-        newHeaders.set('Accept', accept);
-    }
-
+    // 【修复 1】：取消透传前端的 Accept，防止目标 API 返回 JSON 数据导致后续无法解析 Base64
+    newHeaders.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain,application/x-envoy,*/*;q=0.8');
+    
+    // 【修复 2】：移除浏览器 UA 中的 Mozilla 标识，防止被订阅防DDoS面板识别为浏览器而返回网页
     newHeaders.set(
         'User-Agent',
-        `v2rayN/6.45 cmliu/CF-Workers-SUB ${追加UA}(${userAgentHeader || ''})`
+        `v2rayN/6.45 cmliu/CF-Workers-SUB ${追加UA}`
     );
 
     const modifiedRequest = new Request(targetUrl, {
