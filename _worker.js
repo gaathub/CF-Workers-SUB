@@ -21,15 +21,15 @@ let subConverter = "SUBAPI.cmliussss.net";
 let subConfig = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; 
 let subProtocol = 'https';
 
-// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
-// 默认的节点处理配置 (UI 未设置时的初始值)
+// ====== 【新增功能：默认节点处理配置 (包含查找替换)】开始 ======
 const DEFAULT_NODE_EDIT_CONFIG = {
     retainProtocols: [], dropProtocols: [],
     retainNameRegex: '', dropNameRegex: '',
+    replaceTarget: '', replaceWith: '',   // 新增：查找与替换
     globalRename: '', addPrefix: '', addSuffix: '',
     autoEmoji: true, deepDeduplicate: true, sortNodes: true, dropInvalidNodes: true
 };
-// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
+// ====== 【新增功能：默认节点处理配置】结束 ======
 
 export default {
     async fetch(request, env) {
@@ -38,7 +38,6 @@ export default {
         const url = new URL(request.url);
         const token = url.searchParams.get('token');
         
-        // 读取环境变量中的账号密码
         AdminUser = env.ADMIN_USER || AdminUser;
         AdminPass = env.ADMIN_PASS || AdminPass;
         
@@ -69,7 +68,21 @@ export default {
         let expire = Math.floor(timestamp / 1000);
         SUBUpdateTime = env.SUBUPTIME || SUBUpdateTime;
 
-        // 【拦截管理后台独立路由】
+        // ====== 【新增功能：提供 /preview 接口给前端动态生成预览】开始 ======
+        if (request.method === 'POST' && url.pathname === '/preview') {
+            try {
+                const data = await request.json();
+                let result = processAndEditSubNodes(data.links || '', data.config || {});
+                if (data.customNodes && data.customNodes.trim()) {
+                    result += '\n' + data.customNodes.trim();
+                }
+                return new Response(result, { status: 200, headers: { "Content-Type": "text/plain;charset=utf-8" } });
+            } catch (e) {
+                return new Response("解析异常", { status: 400 });
+            }
+        }
+        // ====== 【新增功能：提供 /preview 接口给前端动态生成预览】结束 ======
+
         if (url.pathname === '/admin' || url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/') {
             const sessionToken = await MD5MD5(AdminUser + AdminPass + "CF-SUB-SECURE");
             return await handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, guestToken, url, mytoken, FileName, subProtocol, subConverter, subConfig, userAgentHeader);
@@ -82,8 +95,6 @@ export default {
             else if (env.URL) return await proxyURL(env.URL, url);
             else return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
         } else {
-            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
-            // 在获取节点数据前，先从 KV 提取用户在面板设置的“二次编辑参数”与“自定义节点”
             let dynamicConfig = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG);
             let customOutputNodes = "";
             if (env.KV) {
@@ -100,7 +111,6 @@ export default {
                 MainData = env.LINK || MainData;
                 if (env.LINKSUB) urls = await ADD(env.LINKSUB);
             }
-            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
 
             let 重新汇总所有链接 = await ADD(MainData + '\n' + urls.join('\n'));
             let 自建节点 = "";
@@ -159,15 +169,8 @@ export default {
             const uniqueLines = new Set(text.split('\n'));
             let result = [...uniqueLines].join('\n');
 
-            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
-            // 核心修改：利用面板传入的动态配置进行过滤、排序与改名
             result = processAndEditSubNodes(result, dynamicConfig);
-            
-            // 核心修改：追加自定义节点（不受上方任何过滤和重命名的影响）
-            if (customOutputNodes.trim()) {
-                result = result + '\n' + customOutputNodes.trim();
-            }
-            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
+            if (customOutputNodes.trim()) { result = result + '\n' + customOutputNodes.trim(); }
 
             let base64Data;
             try { base64Data = btoa(result); } catch (e) { base64Data = encodeBase64(result); }
@@ -241,8 +244,6 @@ async function handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, g
         return new Response(renderLoginHTML(), { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
     }
 
-    // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
-    // 处理带 JSON 的 POST 请求，用于统一保存配置、自定义节点、和原始节点
     if (request.method === 'POST' && url.pathname === '/admin') {
         if (!env.KV) return new Response("未绑定KV", { status: 400 });
         const contentType = request.headers.get('content-type') || '';
@@ -278,10 +279,8 @@ async function handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, g
     return new Response(renderDashboardHTML(content, customNodes, configObj, guest, url, mytoken, FileName, hasKV, subProtocol, subConverter, subConfig, userAgentHeader), {
         headers: { "Content-Type": "text/html;charset=utf-8" }
     });
-    // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
 }
 
-// ---------------- UI HTML 模板 ----------------
 const globalCSS = `
 <style>
     :root { --glass-bg: rgba(17, 25, 40, 0.6); --glass-border: rgba(255, 255, 255, 0.125); --neon-cyan: #00f3ff; --neon-purple: #b026ff; }
@@ -318,10 +317,7 @@ function renderLoginHTML(isError = false) {
 </body></html>`;
 }
 
-// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
-// 修改渲染 HTML 函数，接收 customNodes 和 configObj
 function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoken, FileName, hasKV, subProtocol, subConverter, subConfig, userAgentHeader) {
-// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
     const subItems = [
         { name: '自适应', path: `/${mytoken}?sub`, badge: 'bg-blue-500/20 text-blue-300 border-blue-500/30' },
         { name: 'Base64', path: `/${mytoken}?b64`, badge: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30' },
@@ -382,6 +378,11 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                     </div>
                     <div class="flex items-center gap-3">
                         <span id="saveStatus" class="text-xs text-[var(--neon-cyan)] font-mono mr-2"></span>
+                        <!-- ====== 【新增功能：预览按钮】开始 ====== -->
+                        <button id="previewBtn" class="glass-card flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-white hover:text-[var(--neon-cyan)] hover:border-[var(--neon-cyan)] transition-all cursor-pointer">
+                            🔍 预览结果
+                        </button>
+                        <!-- ====== 【新增功能：预览按钮】结束 ====== -->
                         <button id="saveBtn" class="neon-btn flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-black cursor-pointer">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
                             保存配置
@@ -389,11 +390,10 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                     </div>
                 </div>
                 ${hasKV ? `
-                <textarea id="content" class="glass-input w-full p-4 h-[200px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-green-400" placeholder="# 粘贴你的原始节点或订阅链接...">${content}</textarea>
+                <textarea id="content" class="glass-input w-full p-4 h-[120px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-green-400" placeholder="# 粘贴你的原始节点或订阅链接...">${content}</textarea>
                 ` : '<div class="h-[100px] flex items-center justify-center bg-red-900/20 rounded-xl border-2 border-dashed border-red-500/50 text-red-400 font-medium backdrop-blur-sm">未绑定 KV，无法使用功能</div>'}
             </div>
 
-            <!-- ====== 【新增功能：可视化二次编辑面板】开始 ====== -->
             ${hasKV ? `
             <div class="glass-card rounded-2xl p-6">
                 <h2 class="text-lg font-bold text-white mb-1 tracking-wide">节点二次编辑规则 (Rules)</h2>
@@ -418,37 +418,61 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                     </label>
                 </div>
 
-                <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <!-- ====== 【新增功能：UI 查找替换框】开始 ====== -->
+                    <div class="md:col-span-2">
+                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">查找关键字 (精准替换)</label>
+                        <input type="text" id="cfg_replaceTarget" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceTarget || ''}" placeholder="例: @clashV8">
+                    </div>
+                    <div class="md:col-span-2">
+                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">替换为 (留空则直接删除该词)</label>
+                        <input type="text" id="cfg_replaceWith" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceWith || ''}" placeholder="例: 星链">
+                    </div>
+                    <!-- ====== 【新增功能：UI 查找替换框】结束 ====== -->
+
                     <div>
-                        <label class="text-[10px] text-gray-400 block mb-1">正则保留(名称)</label>
+                        <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则保留(名称)</label>
                         <input type="text" id="cfg_retainNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.retainNameRegex || ''}" placeholder="如：香港|日本">
                     </div>
                     <div>
-                        <label class="text-[10px] text-gray-400 block mb-1">正则剔除(名称)</label>
+                        <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则剔除(名称)</label>
                         <input type="text" id="cfg_dropNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.dropNameRegex || ''}" placeholder="如：过期|流量">
                     </div>
                     <div>
-                        <label class="text-[10px] text-gray-400 block mb-1">全局重命名</label>
+                        <label class="text-[10px] text-gray-400 block mb-1 mt-2">全局重命名(覆盖)</label>
                         <input type="text" id="cfg_globalRename" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.globalRename || ''}" placeholder="如：专属节点">
                     </div>
-                    <div>
-                        <label class="text-[10px] text-gray-400 block mb-1">统一前缀</label>
-                        <input type="text" id="cfg_addPrefix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addPrefix || ''}" placeholder="如：🚀 ">
-                    </div>
-                    <div>
-                        <label class="text-[10px] text-gray-400 block mb-1">统一后缀</label>
-                        <input type="text" id="cfg_addSuffix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
+                    <div class="flex gap-2">
+                        <div class="w-1/2">
+                            <label class="text-[10px] text-gray-400 block mb-1 mt-2">统一前缀</label>
+                            <input type="text" id="cfg_addPrefix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addPrefix || ''}" placeholder="如：🚀">
+                        </div>
+                        <div class="w-1/2">
+                            <label class="text-[10px] text-gray-400 block mb-1 mt-2">统一后缀</label>
+                            <input type="text" id="cfg_addSuffix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
+                        </div>
                     </div>
                 </div>
             </div>
 
             <div class="glass-card rounded-2xl p-6 flex flex-col">
-                <h2 class="text-lg font-bold text-[var(--neon-purple)] mb-1 tracking-wide">自定义输出节点 (Custom Output)</h2>
+                <h2 class="text-lg font-bold text-pink-400 mb-1 tracking-wide">自定义输出节点 (Custom Output)</h2>
                 <p class="text-[11px] text-gray-400 mb-4 font-mono">在此填写的节点将<strong class="text-white">不受上方规则限制</strong>，强制追加到订阅末尾</p>
-                <textarea id="customNodes" class="glass-input w-full p-4 h-[120px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴需要强制置入的自建节点...">${customNodes}</textarea>
+                <textarea id="customNodes" class="glass-input w-full p-4 h-[80px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴需要强制置入的自建节点...">${customNodes}</textarea>
             </div>
+            
+            <!-- ====== 【新增功能：预览效果展示区】开始 ====== -->
+            <div id="previewSection" class="glass-card rounded-2xl p-6 hidden flex-col border border-[var(--neon-cyan)] shadow-[0_0_20px_rgba(0,243,255,0.2)]">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-lg font-bold text-[var(--neon-cyan)] tracking-wide">节点预览结果 (Preview)</h2>
+                    <button onclick="document.getElementById('previewSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xs border border-gray-600 px-3 py-1 rounded-full">✕ 关闭预览</button>
+                </div>
+                <p class="text-[11px] text-gray-400 mb-2 font-mono">以下是经过你的规则处理后，最终分发给客户端的节点名称，确认无误后请点击【保存配置】</p>
+                <textarea id="previewContent" class="glass-input w-full p-4 h-[300px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-blue-300 bg-black/40" readonly></textarea>
+            </div>
+            <!-- ====== 【新增功能：预览效果展示区】结束 ====== -->
+
             ` : ''}
-            <!-- ====== 【新增功能：可视化二次编辑面板】结束 ====== -->
             
             <div class="glass-card rounded-2xl p-5 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono text-gray-400">
                 <div class="space-y-2">
@@ -467,7 +491,6 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
         <div class="lg:col-span-5 flex flex-col gap-6">
             <div class="glass-card rounded-2xl p-6 relative overflow-hidden">
                 <div class="absolute -top-10 -right-10 w-32 h-32 bg-[var(--neon-cyan)] rounded-full mix-blend-screen filter blur-[60px] opacity-20 pointer-events-none"></div>
-                
                 <h2 class="text-lg font-bold text-white mb-1 tracking-wide">专属订阅地址 My Subs</h2>
                 <p class="text-[11px] text-gray-400 mb-5 font-mono">Click cards to copy links & view QR</p>
                 <div class="grid grid-cols-2 gap-4">
@@ -538,42 +561,93 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
 
         function copyTo(text) { navigator.clipboard.writeText(text).then(() => { showToast('订阅链接已复制到剪贴板！'); }); }
 
+        function getPayload() {
+            let content = document.getElementById('content') ? document.getElementById('content').value.replace(/：/g, ':') : '';
+            content = decodeNodeNameSafe(content);
+            let customNodes = document.getElementById('customNodes') ? document.getElementById('customNodes').value.replace(/：/g, ':') : '';
+            customNodes = decodeNodeNameSafe(customNodes);
+            return {
+                links: content,
+                customNodes: customNodes,
+                config: {
+                    autoEmoji: document.getElementById('cfg_autoEmoji') ? document.getElementById('cfg_autoEmoji').checked : true,
+                    deepDeduplicate: document.getElementById('cfg_deepDeduplicate') ? document.getElementById('cfg_deepDeduplicate').checked : true,
+                    sortNodes: document.getElementById('cfg_sortNodes') ? document.getElementById('cfg_sortNodes').checked : true,
+                    dropInvalidNodes: document.getElementById('cfg_dropInvalidNodes') ? document.getElementById('cfg_dropInvalidNodes').checked : true,
+                    globalRename: document.getElementById('cfg_globalRename') ? document.getElementById('cfg_globalRename').value : '',
+                    addPrefix: document.getElementById('cfg_addPrefix') ? document.getElementById('cfg_addPrefix').value : '',
+                    addSuffix: document.getElementById('cfg_addSuffix') ? document.getElementById('cfg_addSuffix').value : '',
+                    retainNameRegex: document.getElementById('cfg_retainNameRegex') ? document.getElementById('cfg_retainNameRegex').value : '',
+                    dropNameRegex: document.getElementById('cfg_dropNameRegex') ? document.getElementById('cfg_dropNameRegex').value : '',
+                    replaceTarget: document.getElementById('cfg_replaceTarget') ? document.getElementById('cfg_replaceTarget').value : '',
+                    replaceWith: document.getElementById('cfg_replaceWith') ? document.getElementById('cfg_replaceWith').value : '',
+                }
+            };
+        }
+
+        // ====== 【新增功能：处理前端预览请求动作】开始 ======
+        const previewBtn = document.getElementById('previewBtn');
+        if (previewBtn) {
+            previewBtn.onclick = async () => {
+                previewBtn.innerHTML = '⏳ 解析中...';
+                previewBtn.disabled = true;
+                try {
+                    const payload = getPayload();
+                    const res = await fetch('/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    let text = await res.text();
+                    
+                    // 为了让预览极其直观，我们将后端的机器节点格式解析成人类可读格式
+                    text = text.split('\\n').map(line => {
+                        let name = ''; let type = '';
+                        if (line.startsWith('vmess://')) {
+                            try {
+                                let b64Str = line.substring(8).replace(/-/g, '+').replace(/_/g, '/');
+                                while (b64Str.length % 4 !== 0) b64Str += '=';
+                                let jsonStr = decodeURIComponent(atob(b64Str).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+                                name = JSON.parse(jsonStr).ps; type = 'VMESS';
+                            } catch(e) { name = '解析失败'; type = 'VMESS'; }
+                        } else if (line.includes('://')) {
+                            let hashIndex = line.lastIndexOf('#');
+                            if (hashIndex !== -1) {
+                                try { name = decodeURIComponent(line.substring(hashIndex + 1)); } 
+                                catch(e) { name = line.substring(hashIndex + 1); }
+                            }
+                            type = line.split('://')[0].toUpperCase();
+                        } else {
+                            return line; // Not a standard node
+                        }
+                        return \`[\${type}] \${name}\\n └─ \${line.substring(0, 45)}...\`;
+                    }).join('\\n\\n');
+
+                    document.getElementById('previewContent').value = text;
+                    document.getElementById('previewSection').classList.remove('hidden');
+                    document.getElementById('previewSection').classList.add('flex');
+                    document.getElementById('previewSection').scrollIntoView({ behavior: 'smooth', block: 'center' });
+                } catch (e) {
+                    alert('预览请求失败，请检查网络');
+                } finally {
+                    previewBtn.innerHTML = '🔍 预览结果';
+                    previewBtn.disabled = false;
+                }
+            };
+        }
+        // ====== 【新增功能：处理前端预览请求动作】结束 ======
+
         const btn = document.getElementById('saveBtn');
         if(btn) {
-            const setUnsavedStatus = () => { document.getElementById('saveStatus').innerHTML = '<span class="text-yellow-400 drop-shadow-[0_0_5px_rgba(250,204,21,0.5)]">⚠️ 有未修改保存</span>'; };
+            const setUnsavedStatus = () => { document.getElementById('saveStatus').innerHTML = '<span class="text-yellow-400 drop-shadow-[0_0_5px_rgba(250,204,21,0.5)]">⚠️ 尚未保存</span>'; };
 
             const saveAction = async () => {
                 btn.innerHTML = '<svg class="animate-spin h-4 w-4 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> 写入中...';
                 btn.disabled = true; btn.style.filter = "brightness(0.7)";
                 
                 try {
-                    let content = document.getElementById('content').value.replace(/：/g, ':');
-                    content = decodeNodeNameSafe(content);
-                    document.getElementById('content').value = content;
-                    
-                    // ====== 【新增功能：前台配置统一打包 POST 给后台】开始 ======
-                    let customNodes = document.getElementById('customNodes') ? document.getElementById('customNodes').value.replace(/：/g, ':') : '';
-                    customNodes = decodeNodeNameSafe(customNodes);
-                    if(document.getElementById('customNodes')) document.getElementById('customNodes').value = customNodes;
+                    const payload = getPayload();
+                    // Update Textareas with decoded clean format
+                    document.getElementById('content').value = payload.links;
+                    document.getElementById('customNodes').value = payload.customNodes;
 
-                    const payload = {
-                        links: content,
-                        customNodes: customNodes,
-                        config: {
-                            autoEmoji: document.getElementById('cfg_autoEmoji') ? document.getElementById('cfg_autoEmoji').checked : true,
-                            deepDeduplicate: document.getElementById('cfg_deepDeduplicate') ? document.getElementById('cfg_deepDeduplicate').checked : true,
-                            sortNodes: document.getElementById('cfg_sortNodes') ? document.getElementById('cfg_sortNodes').checked : true,
-                            dropInvalidNodes: document.getElementById('cfg_dropInvalidNodes') ? document.getElementById('cfg_dropInvalidNodes').checked : true,
-                            globalRename: document.getElementById('cfg_globalRename') ? document.getElementById('cfg_globalRename').value : '',
-                            addPrefix: document.getElementById('cfg_addPrefix') ? document.getElementById('cfg_addPrefix').value : '',
-                            addSuffix: document.getElementById('cfg_addSuffix') ? document.getElementById('cfg_addSuffix').value : '',
-                            retainNameRegex: document.getElementById('cfg_retainNameRegex') ? document.getElementById('cfg_retainNameRegex').value : '',
-                            dropNameRegex: document.getElementById('cfg_dropNameRegex') ? document.getElementById('cfg_dropNameRegex').value : '',
-                        }
-                    };
-                    
                     const res = await fetch('/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                    // ====== 【新增功能：前台配置统一打包 POST 给后台】结束 ======
 
                     if(res.ok) {
                         const time = new Date().toLocaleTimeString();
@@ -587,10 +661,7 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
             };
             
             btn.onclick = saveAction;
-            
-            document.querySelectorAll('input, textarea').forEach(el => {
-                el.addEventListener('input', setUnsavedStatus);
-            });
+            document.querySelectorAll('input, textarea').forEach(el => { el.addEventListener('input', setUnsavedStatus); });
         }
 
         function toggleNotice() {
@@ -609,7 +680,7 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
 
 // ================= 底层基础依赖函数与逻辑 =================
 
-// ====== 【新增功能：核心规则解析与执行模块】开始 ======
+// ====== 【新增功能：核心规则解析与执行模块 (增加查找替换逻辑)】开始 ======
 function processAndEditSubNodes(content, config) {
     let lines = content.split('\n');
     let parsedNodes = [];
@@ -661,6 +732,17 @@ function processAndEditSubNodes(content, config) {
             const identifier = `${node.protocol}:${node.address}:${node.port}:${node.id}`;
             if (uniqueIdentifiers.has(identifier)) continue; 
             uniqueIdentifiers.add(identifier);
+        }
+
+        // 核心修改点：查找并替换逻辑 (在全局覆盖重命名前执行)
+        if (config.replaceTarget) {
+            try {
+                // 使用不区分大小写的正则替换，能匹配所有出现的位置
+                node.name = node.name.replace(new RegExp(config.replaceTarget, 'gi'), config.replaceWith || '');
+            } catch(e) {
+                // 防止输入了非法正则符号导致报错，回退到普通字符串替换
+                node.name = node.name.split(config.replaceTarget).join(config.replaceWith || '');
+            }
         }
 
         if (config.globalRename) node.name = config.globalRename;
@@ -739,7 +821,7 @@ function rebuildSingleNode(node) {
         return urlObj.toString();
     }
 }
-// ====== 【新增功能：核心规则解析与执行模块】结束 ======
+// ====== 【新增功能：核心规则解析与执行模块 (增加查找替换逻辑)】结束 ======
 
 async function ADD(envadd) {
     var addtext = envadd.replace(/[  "'|\r\n]+/g, '\n').replace(/\n+/g, '\n');
