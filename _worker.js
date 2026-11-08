@@ -3,13 +3,13 @@ let AdminUser = 'admin';  // 后台登录用户名 (可在环境变量中设置 
 let AdminPass = '123456'; // 后台登录密码 (可在环境变量中设置 ADMIN_PASS)
 
 let mytoken = 'auto';
-let guestToken = ''; 
-let BotToken = ''; 
-let ChatID = ''; 
-let TG = 0; 
+let guestToken = '';
+let BotToken = '';
+let ChatID = '';
+let TG = 0;
 let FileName = 'CF-Workers-SUB';
-let SUBUpdateTime = 6; 
-let total = 99;
+let SUBUpdateTime = 6;
+let total = 99;              // 保留原变量，避免外部引用报错
 let timestamp = 4102329600000;
 
 let MainData = `
@@ -17,33 +17,28 @@ https://cfxr.eu.org/getSub
 `;
 
 let urls = [];
-let subConverter = "SUBAPI.cmliussss.net"; 
-let subConfig = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; 
+let subConverter = "SUBAPI.cmliussss.net";
+let subConfig = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini";
 let subProtocol = 'https';
 
-// ====== 【节点处理配置对象】 ======
+// ====== 【节点处理配置对象】（保持与原项目完全一致的结构，兼容旧 EDIT_CONFIG.json） ======
 const DEFAULT_NODE_EDIT_CONFIG = {
     retainProtocols: [], dropProtocols: [],
     retainNameRegex: '', dropNameRegex: '',
     replaceTarget: '', replaceWith: '',
     globalRename: '', addPrefix: '', addSuffix: '',
     autoEmoji: true, deepDeduplicate: true, sortNodes: true, dropInvalidNodes: true,
-    specificRules: {}, // 专属节点的特殊前后缀规则
-    outputLimit: 0, favorites: []
+    specificRules: {} // 专属节点的特殊前后缀规则
 };
 
-function chooseOutputNodes(nodes, config) {
-    const limit = Number(config?.outputLimit || 0);
-    if (!Number.isInteger(limit) || limit < 0) throw new Error('节点数量限制必须是非负整数');
-    const favorites = new Set(Array.isArray(config?.favorites) ? config.favorites : []);
-    const pinned = nodes.filter(n => n.valid && favorites.has(nodeStableId(n)));
-    const ordinary = nodes.filter(n => !n.valid || !favorites.has(nodeStableId(n)));
-    if (!limit || nodes.length <= limit || pinned.length >= limit) return pinned.length >= limit && limit ? [...pinned, ...ordinary.filter(n=>!n.valid)] : nodes;
-    const pool = ordinary.filter(n => n.valid);
-    for (let i=pool.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [pool[i],pool[j]]=[pool[j],pool[i]]; }
-    return [...pinned, ...pool.slice(0, Math.max(0, limit-pinned.length)), ...ordinary.filter(n=>!n.valid)];
-}
-function nodeStableId(n) { return n.protocol === 'vmess' ? `${n.protocol}://${n.address}:${n.port}/${n.id}` : `${n.protocol}://${n.address}:${n.port}/${n.id || ''}`; }
+// ====== 【新增：全局配置快照】 ======
+// Cloudflare KV 不支持事务，因此"保存所有配置"只写一个键（单次 put 天然原子），
+// 旧键（LINK.txt / CUSTOM_NODES.txt / EDIT_CONFIG.json）作为兼容镜像最后写入。
+const KV_SNAPSHOT_KEY = 'CONFIG_V2.json';
+const CONFIG_VERSION = 3;
+const HISTORY_MAX_STEPS = 10;      // 撤销/重做各最多 10 步
+const LIMIT_MAX = 20000;           // 数量限制合理上界
+const LINKS_MAX_LEN = 512 * 1024;  // 抓取源长度上界，防止误覆盖
 
 export default {
     async fetch(request, env) {
@@ -77,57 +72,73 @@ export default {
         const 访客订阅 = guestToken;
         SUBUpdateTime = env.SUBUPTIME || SUBUpdateTime;
 
-        // ====== 【核心升级 1：处理预览请求并真实抓取远程链接】 ======
+        // ====== 【实时预览接口：真实抓取 + 真实规则处理 + 真实数量限制】 ======
         if (request.method === 'POST' && url.pathname === '/preview') {
-            // 预览会代替后台请求用户填写的远程订阅地址，只允许已登录管理员调用。
             const previewSessionToken = await MD5MD5(AdminUser + AdminPass + "CF-SUB-SECURE");
             if (getCookie(request, 'admin_session') !== previewSessionToken) {
-                return new Response(JSON.stringify({
+                return jsonResponse({
+                    ok: false,
                     error: '未登录或登录已过期，请重新登录后台'
-                }), {
-                    status: 401,
-                    headers: {
-                        "Content-Type": "application/json;charset=utf-8",
-                        "Cache-Control": "no-store"
-                    }
-                });
+                }, 401);
+            }
+
+            let data;
+            try {
+                data = await request.json();
+            } catch (e) {
+                return jsonResponse({ ok: false, error: '请求体不是合法 JSON' }, 400);
+            }
+
+            let cfg;
+            try {
+                cfg = normalizeIncoming(data);
+            } catch (e) {
+                return jsonResponse({ ok: false, error: e.message }, 400);
             }
 
             try {
-                const textData = await request.text();
-                const data = JSON.parse(textData);
+                // 1. 真实抓取（明文节点 + 全部远程订阅并发）
+                const fetched = await resolveLinksToNodes(cfg.links || '', request, userAgentHeader);
 
-                // 1. 真实抓取远程链接的内容
-                const rawResolved = await resolveLinksToNodes(
-                    data.links || '',
-                    request,
-                    userAgentHeader
+                // 2. 规则处理
+                const stats = createStats();
+                let baseNodes = processNodes(fetched.text, cfg.rules, stats);
+
+                // 3. 自定义输出节点（保持原项目设计：不受普通过滤规则限制）
+                let customNodes = processNodes(
+                    cfg.customNodes || '',
+                    Object.assign({}, cfg.rules, { isCustom: true }),
+                    stats
                 );
 
-                // 2. 将抓取到的裸节点输入二次编辑引擎处理
-                const processedArray = processNodes(rawResolved, data.config || {});
+                // 4. 合并 + 收藏标记 + 数量限制
+                const merged = mergeNodes(baseNodes, customNodes);
+                const favInfo = applyFavorites(merged, cfg.favorites);
+                const limitInfo = selectByLimit(merged, cfg.output, favInfo.idSet, dailySeed());
 
-                // 3. 处理自定义节点（不受上方过滤规则限制）
-                const customArray = processNodes(
-                    data.customNodes || '',
-                    Object.assign({}, data.config, { isCustom: true })
-                );
-
-                return new Response(JSON.stringify({
-                    nodes: processedArray,
-                    customNodes: customArray
-                }), {
-                    status: 200,
-                    headers: { "Content-Type": "application/json;charset=utf-8" }
-                });
+                // 5. 输出
+                return jsonResponse({
+                    ok: true,
+                    seed: dailySeed(),
+                    sources: fetched.report,
+                    plainCount: fetched.plainCount,
+                    nodes: serializeNodes(baseNodes),
+                    customNodes: serializeNodes(customNodes),
+                    stats: Object.assign({}, stats, {
+                        baseCount: baseNodes.length,
+                        customCount: customNodes.length,
+                        mergedCount: merged.length,
+                        favorites: favInfo.matched,
+                        favoritesUnmatched: favInfo.unmatched,
+                        limit: limitInfo
+                    })
+                }, 200);
             } catch (e) {
                 console.error("Preview Error:", e);
-                return new Response(JSON.stringify({
-                    error: "解析或抓取异常: " + e.message
-                }), {
-                    status: 400,
-                    headers: { "Content-Type": "application/json;charset=utf-8" }
-                });
+                return jsonResponse({
+                    ok: false,
+                    error: e.message || '解析或抓取异常'
+                }, 400);
             }
         }
 
@@ -159,7 +170,7 @@ export default {
             );
         }
 
-        // ================= 原有订阅分发逻辑 (融入最终生效规则) =================
+        // ================= 原有订阅分发逻辑 =================
         if (!(
             [mytoken, fakeToken, 访客订阅].includes(token) ||
             url.pathname == ("/" + mytoken) ||
@@ -188,40 +199,27 @@ export default {
                 });
             }
         } else {
-            let dynamicConfig = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG);
-            let customOutputNodes = "";
+            // ====== 读取"最近一次全局保存成功"的正式配置 ======
+            const cfg = await loadConfig(env, false);
 
             if (env.KV) {
                 await 迁移地址列表(env, 'LINK.txt');
 
                 if (userAgent.includes('mozilla') && !url.search) {
                     return Response.redirect(`${url.origin}/admin`, 302);
-                } else {
-                    let snapshot = await env.KV.get('CONFIG_SNAPSHOT.json');
-                    if (snapshot) {
-                        try { const committed = JSON.parse(snapshot); MainData = committed.links ?? MainData; customOutputNodes = committed.customNodes ?? ''; Object.assign(dynamicConfig, committed.config || {}); } catch (_) {}
-                    } else {
-                    MainData = await env.KV.get('LINK.txt') || MainData;
-                    customOutputNodes = await env.KV.get('CUSTOM_NODES.txt') || "";
-                    let kvCfg = await env.KV.get('EDIT_CONFIG.json');
-                    if (kvCfg) {
-                        try {
-                            Object.assign(dynamicConfig, JSON.parse(kvCfg));
-                        } catch (e) {}
-                    }
-                    }
                 }
             } else {
-                MainData = env.LINK || MainData;
+                cfg.links = env.LINK || cfg.links || MainData;
                 if (env.LINKSUB) urls = await ADD(env.LINKSUB);
             }
 
-            // 获取基础裸节点
-            let req_data = await resolveLinksToNodes(
-                MainData + '\n' + urls.join('\n'),
+            // 获取基础裸节点（明文 + 远程订阅）
+            const fetched = await resolveLinksToNodes(
+                (cfg.links || '') + '\n' + urls.join('\n'),
                 request,
                 userAgentHeader
             );
+            const req_data = fetched.text;
 
             const isSubConverterRequest =
                 request.headers.get('subconverter-request') ||
@@ -282,23 +280,41 @@ export default {
                 订阅转换URL += "|" + (await ADD(env.WARP)).join("|");
             }
 
-            // ====== 核心修改：节点统一处理与重组 ======
-            const utf8Encoder = new TextEncoder();
-            const text = new TextDecoder().decode(utf8Encoder.encode(req_data));
-            const uniqueLines = [...new Set(text.split('\n'))].join('\n');
+            // ====== 节点统一处理与重组（与预览共用同一套算法） ======
+            let nodeArray = [];
+            let customArray = [];
 
-            // 按照最新的规则处理抓取到的节点
-            let nodeArray = processNodes(uniqueLines, dynamicConfig);
+            try {
+                nodeArray = processNodes(req_data, cfg.rules, createStats());
+                customArray = processNodes(
+                    cfg.customNodes || '',
+                    Object.assign({}, cfg.rules, { isCustom: true }),
+                    createStats()
+                );
+            } catch (e) {
+                // 规则异常时退化为"仅解析不加工"，保证订阅地址永远可用
+                console.error('规则处理异常，降级为基础解析:', e);
+                const fallback = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG, {
+                    retainNameRegex: '', dropNameRegex: '',
+                    replaceTarget: '', globalRename: '',
+                    addPrefix: '', addSuffix: ''
+                });
+                nodeArray = processNodes(req_data, fallback, createStats());
+                customArray = processNodes(
+                    cfg.customNodes || '',
+                    Object.assign({}, fallback, { isCustom: true }),
+                    createStats()
+                );
+            }
 
-            // 独立处理自定义节点
-            let customArray = processNodes(
-                customOutputNodes,
-                Object.assign({}, dynamicConfig, { isCustom: true })
-            );
+            const merged = mergeNodes(nodeArray, customArray);
+            const favInfo = applyFavorites(merged, cfg.favorites);
 
-            // 合并输出
-            let outputNodes = chooseOutputNodes([...nodeArray, ...processNodes(customOutputNodes, Object.assign({}, dynamicConfig, { isCustom: true }))], dynamicConfig);
-            let finalOutput = buildSubString(outputNodes);
+            // 【关键】数量限制必须在订阅生成环节真正执行，而不是只在预览里截断
+            selectByLimit(merged, cfg.output, favInfo.idSet, dailySeed());
+
+            const finalNodes = merged.filter(n => n.selected);
+            const finalOutput = buildSubString(finalNodes);
 
             let base64Data;
 
@@ -370,44 +386,451 @@ export default {
 };
 
 
-// ================= 核心工具函数：真实拉取远程节点 =================
-async function resolveLinksToNodes(text, request, userAgentHeader) {
-    let urls = await ADD(text);
-    let req_data = "";
-    let selfBuilt = "";
-    let subLinks = "";
-
-    // 区分出自建明文节点和远程订阅链接
-    for (let x of urls) {
-        if (x.toLowerCase().startsWith('http')) {
-            subLinks += x + '\n';
-        } else {
-            selfBuilt += x + '\n';
+// ================= 统一 JSON 响应 =================
+function jsonResponse(obj, status) {
+    return new Response(JSON.stringify(obj), {
+        status: status || 200,
+        headers: {
+            "Content-Type": "application/json;charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate"
         }
-    }
-
-    let linkArr = [...new Set(await ADD(subLinks))]
-        .filter(item => item?.trim?.());
-
-    if (linkArr.length > 0) {
-        let 追加UA = 'v2rayn';
-        const res = await getSUB(
-            linkArr,
-            request,
-            追加UA,
-            userAgentHeader
-        );
-
-        req_data += res[0].join('\n');
-    }
-
-    return selfBuilt + (selfBuilt && req_data ? '\n' : '') + req_data;
+    });
 }
 
 
-// ================= 节点处理核心引擎 (返回结构化对象数组，支撑预览与输出) =================
-function processNodes(content, config) {
-    let lines = content.split('\n');
+// ================= 【配置快照：读取 / 保存 / 兼容迁移】 =================
+function defaultConfig() {
+    return {
+        version: 0,
+        savedAt: '',
+        links: '',
+        customNodes: '',
+        rules: Object.assign({}, DEFAULT_NODE_EDIT_CONFIG),
+        output: { limitEnabled: false, limit: 0 },
+        favorites: [],
+        preview: { keyword: '', onlyFav: false }
+    };
+}
+
+
+// 读取正式生效配置：优先快照，其次旧版三个 KV 键（新旧数据完全兼容）
+async function loadConfig(env, migrate) {
+    const cfg = defaultConfig();
+
+    if (!env || !env.KV) {
+        cfg.links = (env && env.LINK) || MainData || '';
+        return cfg;
+    }
+
+    let snapshotText = null;
+    try {
+        snapshotText = await env.KV.get(KV_SNAPSHOT_KEY);
+    } catch (e) {
+        snapshotText = null;
+    }
+
+    if (snapshotText) {
+        try {
+            const snap = JSON.parse(snapshotText);
+            if (snap && typeof snap === 'object') {
+                cfg.version = Number(snap.version) || 0;
+                cfg.savedAt = snap.savedAt || '';
+                cfg.links = typeof snap.links === 'string' ? snap.links : '';
+                cfg.customNodes = typeof snap.customNodes === 'string' ? snap.customNodes : '';
+                if (snap.rules && typeof snap.rules === 'object') {
+                    cfg.rules = mergeRules(cfg.rules, snap.rules);
+                }
+                if (snap.output && typeof snap.output === 'object') {
+                    cfg.output = normalizeOutput(snap.output);
+                }
+                if (Array.isArray(snap.favorites)) {
+                    cfg.favorites = normalizeFavorites(snap.favorites);
+                }
+                if (snap.preview && typeof snap.preview === 'object') {
+                    cfg.preview = {
+                        keyword: typeof snap.preview.keyword === 'string' ? snap.preview.keyword : '',
+                        onlyFav: !!snap.preview.onlyFav
+                    };
+                }
+                return cfg;
+            }
+        } catch (e) {
+            console.error('配置快照解析失败，回退旧版 KV:', e);
+        }
+    }
+
+    // ====== 旧版 KV 兼容读取 ======
+    try {
+        cfg.links = (await env.KV.get('LINK.txt')) || '';
+        cfg.customNodes = (await env.KV.get('CUSTOM_NODES.txt')) || '';
+
+        const kvCfg = await env.KV.get('EDIT_CONFIG.json');
+        if (kvCfg) {
+            try {
+                cfg.rules = mergeRules(cfg.rules, JSON.parse(kvCfg));
+                cfg.version = CONFIG_VERSION;
+            } catch (e) { }
+        }
+
+        // 首次读取旧数据时，静默生成一份快照，后续保存才有版本号可比对
+        if (migrate && !snapshotText && (cfg.links || cfg.customNodes)) {
+            cfg.version = CONFIG_VERSION;
+            cfg.savedAt = new Date().toISOString();
+            try {
+                await env.KV.put(KV_SNAPSHOT_KEY, JSON.stringify(snapshotFor(cfg)));
+            } catch (e) {
+                console.error('旧配置迁移失败:', e);
+            }
+        }
+    } catch (e) {
+        console.error('读取 KV 异常:', e);
+    }
+
+    return cfg;
+}
+
+
+function snapshotFor(cfg) {
+    return {
+        version: cfg.version,
+        savedAt: cfg.savedAt,
+        links: cfg.links,
+        customNodes: cfg.customNodes,
+        rules: cfg.rules,
+        output: cfg.output,
+        favorites: cfg.favorites,
+        preview: cfg.preview
+    };
+}
+
+
+// ================= 【入参规范化 + 校验】 =================
+function mergeRules(base, incoming) {
+    const out = Object.assign({}, base);
+    if (!incoming || typeof incoming !== 'object') return out;
+
+    const boolKeys = ['autoEmoji', 'deepDeduplicate', 'sortNodes', 'dropInvalidNodes'];
+    const strKeys = ['retainNameRegex', 'dropNameRegex', 'replaceTarget', 'replaceWith',
+        'globalRename', 'addPrefix', 'addSuffix'];
+
+    for (const k of boolKeys) {
+        if (incoming[k] !== undefined) out[k] = !!incoming[k];
+    }
+    for (const k of strKeys) {
+        if (incoming[k] !== undefined) out[k] = incoming[k] === null ? '' : String(incoming[k]);
+    }
+    if (incoming.retainProtocols !== undefined) out.retainProtocols = toProtocolList(incoming.retainProtocols);
+    if (incoming.dropProtocols !== undefined) out.dropProtocols = toProtocolList(incoming.dropProtocols);
+
+    if (incoming.specificRules && typeof incoming.specificRules === 'object') {
+        const safe = {};
+        for (const key of Object.keys(incoming.specificRules)) {
+            const r = incoming.specificRules[key];
+            if (!r || typeof r !== 'object') continue;
+            const item = {};
+            if (r.prefix) item.prefix = String(r.prefix);
+            if (r.suffix) item.suffix = String(r.suffix);
+            if (item.prefix || item.suffix) safe[key] = item;
+        }
+        out.specificRules = safe;
+    }
+
+    return out;
+}
+
+
+function toProtocolList(v) {
+    if (Array.isArray(v)) {
+        return [...new Set(v.map(x => String(x).trim().toLowerCase()).filter(Boolean))];
+    }
+    if (typeof v === 'string') {
+        return [...new Set(v.split(/[,，\s]+/).map(x => x.trim().toLowerCase()).filter(Boolean))];
+    }
+    return [];
+}
+
+
+function normalizeOutput(v) {
+    const out = { limitEnabled: false, limit: 0 };
+    if (v === undefined || v === null) return out;
+
+    if (typeof v === 'number' || typeof v === 'string') {
+        const n = parseInt(v, 10);
+        if (Number.isFinite(n) && n > 0) {
+            out.limitEnabled = true;
+            out.limit = Math.min(n, LIMIT_MAX);
+        }
+        return out;
+    }
+
+    if (typeof v === 'object') {
+        out.limitEnabled = !!v.limitEnabled;
+        const n = parseInt(v.limit, 10);
+        out.limit = Number.isFinite(n) && n > 0 ? Math.min(n, LIMIT_MAX) : 0;
+        if (out.limitEnabled && out.limit < 1) out.limitEnabled = false;
+    }
+    return out;
+}
+
+
+function normalizeFavorites(v) {
+    const out = [];
+    const seen = new Set();
+    if (!Array.isArray(v)) return out;
+
+    for (const item of v) {
+        let id = '';
+        let name = '';
+        if (typeof item === 'string') {
+            id = item.trim();
+        } else if (item && typeof item === 'object') {
+            id = String(item.id || item.fingerprint || '').trim();
+            name = String(item.name || '');
+        }
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id: id, name: name });
+    }
+    return out;
+}
+
+
+// 校验正则是否可编译；保存阶段拦截，避免坏规则进入 KV 影响订阅输出
+function assertRegex(pattern, flags, label) {
+    if (!pattern) return;
+    try {
+        new RegExp(pattern, flags);
+    } catch (e) {
+        throw new Error(`${label} 正则表达式无效：${e.message}`);
+    }
+}
+
+
+function normalizeIncoming(data) {
+    if (!data || typeof data !== 'object') {
+        throw new Error('配置数据格式错误');
+    }
+
+    const cfg = defaultConfig();
+
+    // 兼容旧前端字段 config
+    const rawRules = data.rules || data.config || {};
+
+    cfg.links = typeof data.links === 'string' ? data.links : '';
+    cfg.customNodes = typeof data.customNodes === 'string' ? data.customNodes : '';
+
+    if (cfg.links.length > LINKS_MAX_LEN || cfg.customNodes.length > LINKS_MAX_LEN) {
+        throw new Error('抓取源或自定义节点内容过长，已拒绝保存');
+    }
+
+    cfg.rules = mergeRules(cfg.rules, rawRules);
+    cfg.output = normalizeOutput(data.output !== undefined ? data.output : data.limit);
+    cfg.favorites = normalizeFavorites(data.favorites);
+
+    if (data.preview && typeof data.preview === 'object') {
+        cfg.preview = {
+            keyword: typeof data.preview.keyword === 'string' ? data.preview.keyword : '',
+            onlyFav: !!data.preview.onlyFav
+        };
+    }
+
+    // 保存前把正则全部检查一遍
+    assertRegex(cfg.rules.retainNameRegex, 'i', '正则保留');
+    assertRegex(cfg.rules.dropNameRegex, 'i', '正则剔除');
+    assertRegex(cfg.rules.replaceTarget, 'gi', '查找关键字');
+
+    if (cfg.output.limitEnabled) {
+        if (!Number.isInteger(cfg.output.limit) || cfg.output.limit < 1) {
+            throw new Error('节点数量必须是大于 0 的整数');
+        }
+    }
+
+    return cfg;
+}
+
+
+// ================= 核心工具函数：真实拉取远程节点（分类 + 逐条上报） =================
+async function resolveLinksToNodes(text, request, userAgentHeader) {
+    const allLines = await ADD(String(text || ''));
+    const subLinks = [];
+    const plainLines = [];
+
+    for (let x of allLines) {
+        const line = (x || '').trim();
+        if (!line) continue;
+        if (/^https?:\/\//i.test(line)) subLinks.push(line);
+        else plainLines.push(line);
+    }
+
+    const uniqLinks = [...new Set(subLinks)];
+    const plainText = plainLines.join('\n');
+
+    let remoteText = '';
+    let report = [];
+
+    if (uniqLinks.length > 0) {
+        const res = await fetchSubscriptions(uniqLinks, request, userAgentHeader);
+        remoteText = res.text;
+        report = res.report;
+    }
+
+    return {
+        text: plainText + (plainText && remoteText ? '\n' : '') + remoteText,
+        report: report,
+        plainCount: plainLines.length
+    };
+}
+
+
+// ====== 多订阅源并发抓取与解析（单条失败不影响其他） ======
+async function fetchSubscriptions(sources, request, userAgentHeader) {
+    const list = [...new Set((sources || []).filter(s => typeof s === 'string' && s.trim()))];
+    const report = [];
+    let newapi = '';
+
+    if (list.length === 0) return { text: '', report: report };
+
+    const responses = await Promise.allSettled(
+        list.map(async (apiUrl) => {
+            // 每个订阅源独立超时，避免一个慢源拖垮全部
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 12000);
+            try {
+                const response = await getUrl(request, apiUrl, 'v2rayn', userAgentHeader, controller.signal);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return await response.text();
+            } finally {
+                clearTimeout(timer);
+            }
+        })
+    );
+
+    responses.forEach((response, index) => {
+        const srcUrl = list[index];
+        let host = srcUrl;
+        try { host = new URL(srcUrl).host; } catch (e) { }
+
+        if (response.status !== 'fulfilled') {
+            const reason = response.reason;
+            const msg = reason && reason.name === 'AbortError'
+                ? '请求超时（12 秒）'
+                : (reason && reason.message) || String(reason || '未知错误');
+            console.warn('订阅源抓取失败:', srcUrl, msg);
+            report.push({ url: srcUrl, host: host, ok: false, error: msg, nodes: 0 });
+            return;
+        }
+
+        const content = String(response.value || '')
+            .replace(/^\uFEFF/, '')
+            .trim();
+
+        if (!content) {
+            report.push({ url: srcUrl, host: host, ok: false, error: '返回内容为空', nodes: 0 });
+            return;
+        }
+
+        // Clash YAML / sing-box JSON：无法直接当节点列表解析，明确上报
+        if (
+            content.includes('proxies:') ||
+            (content.includes('outbounds"') && content.includes('inbounds"'))
+        ) {
+            report.push({
+                url: srcUrl, host: host, ok: false,
+                error: '返回的是 Clash/sing-box 配置，不含明文节点，请改填节点订阅地址',
+                nodes: 0
+            });
+            return;
+        }
+
+        if (content.includes('://')) {
+            // 明文节点
+            const count = countNodeLines(content);
+            newapi += content + '\n';
+            report.push({ url: srcUrl, host: host, ok: true, error: '', nodes: count });
+            return;
+        }
+
+        // Base64 订阅
+        const compact = content.replace(/\s/g, '');
+        if (/^[A-Za-z0-9+/_=-]+$/.test(compact)) {
+            try {
+                const decoded = base64Decode(compact);
+                if (!decoded || !decoded.includes('://')) {
+                    throw new Error('Base64 解码后不含节点');
+                }
+                const count = countNodeLines(decoded);
+                newapi += decoded + '\n';
+                report.push({ url: srcUrl, host: host, ok: true, error: '', nodes: count });
+            } catch (error) {
+                console.warn('订阅 Base64 解码失败:', srcUrl, error);
+                report.push({
+                    url: srcUrl, host: host, ok: false,
+                    error: 'Base64 解码失败: ' + (error.message || error),
+                    nodes: 0
+                });
+            }
+        } else {
+            report.push({
+                url: srcUrl, host: host, ok: false,
+                error: '无法识别的返回格式（既不是节点列表也不是 Base64）',
+                nodes: 0
+            });
+        }
+    });
+
+    return { text: newapi, report: report };
+}
+
+
+function countNodeLines(text) {
+    let n = 0;
+    for (const line of String(text || '').split('\n')) {
+        if (line.includes('://')) n++;
+    }
+    return n;
+}
+
+
+// 兼容旧调用（原项目 getSUB 返回值结构）
+async function getSUB(api, request, 追加UA, userAgentHeader) {
+    const res = await fetchSubscriptions(api, request, userAgentHeader);
+    return [await ADD(res.text), ''];
+}
+
+
+// ================= 统计对象 =================
+function createStats() {
+    return {
+        parsed: 0,          // 解析出的节点行数
+        valid: 0,           // 有效节点数
+        invalid: 0,         // 无效节点数
+        droppedProtocol: 0, // 被协议规则剔除
+        droppedName: 0,     // 被名称正则剔除
+        deduped: 0,         // 被深度去重剔除
+        infoNodes: 0,       // 信息节点（流量/到期）
+        renamed: 0,         // 名称被修改的节点数
+        replaceHits: 0      // 被"查找替换"命中并修改名称的节点数
+    };
+}
+
+
+// ================= 节点处理核心引擎（返回结构化对象数组，支撑预览与输出） =================
+function processNodes(content, config, stats) {
+    stats = stats || createStats();
+    const cfg = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG, config || {});
+    const isCustom = !!cfg.isCustom;
+
+    const retainProtocols = toProtocolList(cfg.retainProtocols);
+    const dropProtocols = toProtocolList(cfg.dropProtocols);
+
+    // 正则预编译：错误时抛出可读信息，绝不静默失败
+    const retainRe = compileRegex(cfg.retainNameRegex, 'i', '正则保留');
+    const dropRe = compileRegex(cfg.dropNameRegex, 'i', '正则剔除');
+    const replaceRe = compileRegex(cfg.replaceTarget, 'gi', '查找关键字', true);
+
+    let lines = String(content || '').split('\n');
     let parsedNodes = [];
 
     const EMOJI_MAP = [
@@ -432,17 +855,23 @@ function processNodes(content, config) {
         line = line.trim();
         if (!line) continue;
 
+        stats.parsed++;
+
         let node = parseSingleNode(line);
 
         if (node && node.valid) {
+            stats.valid++;
             parsedNodes.push(node);
         } else if (line.includes('://')) {
+            stats.invalid++;
             parsedNodes.push({
                 valid: false,
                 raw: line,
                 isInfoNode: INFO_NODE_REGEX.test(line),
                 name: line,
-                protocol: line.split('://')[0].toLowerCase()
+                protocol: line.split('://')[0].toLowerCase(),
+                fingerprint: '',
+                identifier: ''
             });
         }
     }
@@ -453,72 +882,78 @@ function processNodes(content, config) {
     for (let node of parsedNodes) {
         // 无效节点处理
         if (!node.valid) {
-            if (node.isInfoNode) finalNodes.push(node);
-            else if (!config.dropInvalidNodes) finalNodes.push(node);
+            if (node.isInfoNode) {
+                stats.infoNodes++;
+                finalNodes.push(node);
+            } else if (!cfg.dropInvalidNodes) {
+                finalNodes.push(node);
+            }
             continue;
         }
 
         // 白名单保护：信息节点原样放行
         if (INFO_NODE_REGEX.test(node.name)) {
             node.isInfoNode = true;
+            stats.infoNodes++;
             finalNodes.push(node);
             continue;
         }
 
-        // 正则过滤
-        if (
-            config.retainProtocols &&
-            config.retainProtocols.length > 0 &&
-            !config.retainProtocols.includes(node.protocol)
-        ) continue;
-
-        if (
-            config.dropProtocols &&
-            config.dropProtocols.length > 0 &&
-            config.dropProtocols.includes(node.protocol)
-        ) continue;
-
-        if (
-            config.retainNameRegex &&
-            !new RegExp(config.retainNameRegex, 'i').test(node.name)
-        ) continue;
-
-        if (
-            config.dropNameRegex &&
-            new RegExp(config.dropNameRegex, 'i').test(node.name)
-        ) continue;
-
-        // 深度去重
-        if (config.deepDeduplicate && !config.isCustom) {
-            const dedupeId =
-                `${node.protocol}:${node.address}:${node.port}:${node.id}`;
-
-            if (uniqueIdentifiers.has(dedupeId)) continue;
-            uniqueIdentifiers.add(dedupeId);
-        }
-
-        if (!config.isCustom) {
-            // 查找替换核心算法
-            if (config.replaceTarget) {
-                try {
-                    node.name = node.name.replace(
-                        new RegExp(config.replaceTarget, 'gi'),
-                        config.replaceWith || ''
-                    );
-                } catch (e) {
-                    node.name = node.name
-                        .split(config.replaceTarget)
-                        .join(config.replaceWith || '');
-                }
+        // 正则过滤（自定义节点不受普通过滤规则限制，保持原项目设计）
+        if (!isCustom) {
+            if (retainProtocols.length > 0 && !retainProtocols.includes(node.protocol)) {
+                stats.droppedProtocol++;
+                continue;
             }
 
-            if (config.globalRename) {
-                node.name = config.globalRename;
+            if (dropProtocols.length > 0 && dropProtocols.includes(node.protocol)) {
+                stats.droppedProtocol++;
+                continue;
+            }
+
+            if (retainRe && !retainRe.test(node.name)) {
+                stats.droppedName++;
+                continue;
+            }
+
+            if (dropRe && dropRe.test(node.name)) {
+                stats.droppedName++;
+                continue;
+            }
+
+            // 深度去重
+            if (cfg.deepDeduplicate) {
+                const dedupeId = node.fingerprint || `${node.protocol}:${node.address}:${node.port}:${node.id}`;
+                if (uniqueIdentifiers.has(dedupeId)) {
+                    stats.deduped++;
+                    continue;
+                }
+                uniqueIdentifiers.add(dedupeId);
+            }
+        }
+
+        if (!isCustom) {
+            // 查找替换核心算法
+            if (cfg.replaceTarget) {
+                const nameBeforeReplace = node.name;
+                if (replaceRe) {
+                    replaceRe.lastIndex = 0;
+                    node.name = node.name.replace(replaceRe, cfg.replaceWith || '');
+                } else {
+                    node.name = node.name
+                        .split(cfg.replaceTarget)
+                        .join(cfg.replaceWith || '');
+                }
+                if (node.name !== nameBeforeReplace) stats.replaceHits++;
+            }
+
+            if (cfg.globalRename) {
+                node.name = cfg.globalRename;
             }
 
             // 自动 Emoji
             if (
-                config.autoEmoji &&
+                cfg.autoEmoji &&
                 !/(?:[\u2700-\u27bf]|(?:\ud83c[\udde6-\uddff]){2}|[\ud800-\udbff][\udc00-\udfff]|[\u0023-\u0039]\ufe0f?\u20e3|\u3299|\u3297|\u303d|\u3030|\u24c2|\ud83c[\udd70-\udd71]|\ud83c[\udd7e-\udd7f]|\ud83c\udd8e|\ud83c[\udd91-\udd9a]|\ud83c[\udde6-\uddff])/.test(node.name)
             ) {
                 for (const item of EMOJI_MAP) {
@@ -533,12 +968,8 @@ function processNodes(content, config) {
             }
 
             // 应用前台传入的个别专属前后缀
-            if (
-                config.specificRules &&
-                node.identifier &&
-                config.specificRules[node.identifier]
-            ) {
-                let sRule = config.specificRules[node.identifier];
+            if (cfg.specificRules && node.identifier && cfg.specificRules[node.identifier]) {
+                let sRule = cfg.specificRules[node.identifier];
 
                 if (sRule.prefix) {
                     node.name = sRule.prefix + node.name;
@@ -549,19 +980,22 @@ function processNodes(content, config) {
                 }
             }
 
-            if (config.addPrefix) {
-                node.name = config.addPrefix + node.name;
+            if (cfg.addPrefix) {
+                node.name = cfg.addPrefix + node.name;
             }
 
-            if (config.addSuffix) {
-                node.name = node.name + config.addSuffix;
+            if (cfg.addSuffix) {
+                node.name = node.name + cfg.addSuffix;
             }
+
+            if (node.name !== node.originalName) stats.renamed++;
         }
 
+        if (!node.isInfoNode) node.isInfoNode = false;
         finalNodes.push(node);
     }
 
-    if (!config.isCustom) {
+    if (!isCustom) {
         // 重名自增
         const nameFrequencies = {};
 
@@ -582,7 +1016,7 @@ function processNodes(content, config) {
         });
 
         // 智能排序
-        if (config.sortNodes) {
+        if (cfg.sortNodes) {
             finalNodes.sort((a, b) => {
                 if (a.isInfoNode && !b.isInfoNode) return -1;
                 if (!a.isInfoNode && b.isInfoNode) return 1;
@@ -592,7 +1026,171 @@ function processNodes(content, config) {
         }
     }
 
+    finalNodes.forEach(n => { n.selected = true; });
+
     return finalNodes;
+}
+
+
+function compileRegex(pattern, flags, label, silent) {
+    if (!pattern) return null;
+    try {
+        return new RegExp(pattern, flags);
+    } catch (e) {
+        if (silent) return null;
+        throw new Error(`${label} 正则表达式无效：${e.message}`);
+    }
+}
+
+
+// ================= 【新增：合并 / 收藏 / 数量限制】 =================
+function mergeNodes(baseNodes, customNodes) {
+    const out = (baseNodes || []).slice();
+    for (const n of (customNodes || [])) {
+        n.isCustom = true;
+        out.push(n);
+    }
+    return out;
+}
+
+
+// 收藏标记：使用稳定指纹（协议|地址|端口|ID），与节点名称无关
+function applyFavorites(nodes, favorites) {
+    const list = normalizeFavorites(favorites);
+    const idSet = new Set(list.map(f => f.id));
+    const matchedIds = new Set();
+    let matched = 0;
+
+    for (const n of nodes) {
+        if (n.fingerprint && idSet.has(n.fingerprint)) {
+            n.favorite = true;
+            matched++;
+            matchedIds.add(n.fingerprint);
+        } else {
+            n.favorite = false;
+        }
+    }
+
+    const unmatched = list
+        .filter(f => !matchedIds.has(f.id))
+        .map(f => f.name || f.id);
+
+    return { idSet: idSet, matched: matched, unmatched: unmatched };
+}
+
+
+// 数量限制 + 随机筛选：收藏节点永远优先保留，普通节点按日种子随机补足
+function selectByLimit(nodes, output, favIdSet, seed) {
+    const opt = normalizeOutput(output);
+
+    let favCount = 0;
+    let infoCount = 0;
+    const normalIdx = [];
+
+    nodes.forEach((n, i) => {
+        if (n.isInfoNode) {
+            n.selected = true;
+            infoCount++;
+            return;
+        }
+        if (n.favorite) {
+            n.selected = true;
+            favCount++;
+            return;
+        }
+        n.selected = false;
+        normalIdx.push(i);
+    });
+
+    const available = favCount + normalIdx.length;
+    let exceeded = false;
+
+    if (!opt.limitEnabled || opt.limit < 1) {
+        // 未启用数量限制：全部输出
+        normalIdx.forEach(i => { nodes[i].selected = true; });
+    } else if (favCount >= opt.limit) {
+        // 收藏数量已达到或超过上限：保留全部收藏，不删除任何收藏节点
+        exceeded = favCount > opt.limit;
+    } else {
+        const remain = opt.limit - favCount;
+        const picked = seededShuffle(normalIdx, seed).slice(0, remain);
+        picked.forEach(i => { nodes[i].selected = true; });
+    }
+
+    const outputCount = nodes.filter(n => n.selected).length;
+
+    return {
+        enabled: opt.limitEnabled && opt.limit >= 1,
+        limit: opt.limit,
+        available: available,
+        favorites: favCount,
+        info: infoCount,
+        output: outputCount,
+        exceeded: exceeded
+    };
+}
+
+
+// 按天固定的随机种子：同一天内多次请求结果一致，避免客户端反复刷新导致节点跳动
+function dailySeed() {
+    const d = new Date(Date.now() + 8 * 3600 * 1000);
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    return `SUB-LIMIT-${y}-${m}-${day}`;
+}
+
+
+function hashSeed(str) {
+    let h = 2166136261 >>> 0;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h >>> 0;
+}
+
+
+function mulberry32(a) {
+    return function () {
+        a |= 0;
+        a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+
+function seededShuffle(arr, seed) {
+    const out = arr.slice();
+    const rnd = mulberry32(hashSeed(seed));
+    for (let i = out.length - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        const tmp = out[i];
+        out[i] = out[j];
+        out[j] = tmp;
+    }
+    return out;
+}
+
+
+// 预览输出用：剥离 urlObj / config 等不可序列化的重型字段
+function serializeNodes(nodes) {
+    return nodes.map(n => ({
+        identifier: n.identifier || '',
+        fingerprint: n.fingerprint || '',
+        name: n.name || '',
+        originalName: n.originalName || n.name || '',
+        protocol: n.protocol || '',
+        valid: !!n.valid,
+        isInfoNode: !!n.isInfoNode,
+        isCustom: !!n.isCustom,
+        raw: n.raw || '',
+        favorite: !!n.favorite,
+        selected: !!n.selected
+    }));
 }
 
 
@@ -633,7 +1231,7 @@ function parseSingleNode(line) {
             };
         } else {
             // 规避 V8 引擎对于非标准协议 (vless/trojan/ss 等) 丢失 host/port 的 URL 解析 bug
-            let match = line.match(/^([a-zA-Z0-9+-.]+):\/\/(.*)$/);
+            let match = line.match(/^([a-zA-Z0-9+\-.]+):\/\/(.*)$/);
             if (!match) return node;
 
             let proto = match[1];
@@ -646,7 +1244,12 @@ function parseSingleNode(line) {
                 urlObj = new URL(line); // 降级处理
             }
 
-            let name = decodeURIComponent(urlObj.hash.slice(1) || '');
+            let name = '';
+            try {
+                name = decodeURIComponent(urlObj.hash.slice(1) || '');
+            } catch (e) {
+                name = urlObj.hash.slice(1) || '';
+            }
 
             node = {
                 valid: !!urlObj.hostname && !!urlObj.port,
@@ -661,13 +1264,18 @@ function parseSingleNode(line) {
             };
         }
 
-        // 生成唯一标识符用于前台精准勾选控制
+        // 生成唯一标识符用于前台精准勾选控制（保持与原项目一致）
         node.identifier =
             `${node.protocol}://${node.address}:${node.port}#${node.originalName}`;
 
+        // 【新增】稳定指纹：不含节点名称，改名 / 加前后缀都不会让收藏关系错位
+        node.fingerprint = node.valid
+            ? `${node.protocol}|${String(node.address || '').toLowerCase()}|${node.port}|${node.id || ''}`
+            : '';
+
         return node;
     } catch (e) {
-        return { valid: false };
+        return { valid: false, raw: line, fingerprint: '', identifier: '' };
     }
 }
 
@@ -699,6 +1307,25 @@ function getCookie(request, name) {
     }
 
     return null;
+}
+
+
+function escHtml(str) {
+    return String(str === undefined || str === null ? '' : str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+
+function safeJSON(obj) {
+    return JSON.stringify(obj)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
 }
 
 
@@ -745,7 +1372,7 @@ async function handleAdminUI(
                 status: 302,
                 headers: {
                     'Location': '/admin',
-                    'Set-Cookie': `admin_session=${sessionToken}; HttpOnly; Path=/; Max-Age=864000`
+                    'Set-Cookie': `admin_session=${sessionToken}; HttpOnly; Path=/; Max-Age=864000; SameSite=Lax`
                 }
             });
         } else {
@@ -761,71 +1388,97 @@ async function handleAdminUI(
         });
     }
 
-    // 全局唯一保存接口
+    // ====== 【统一保存接口：一次提交，全部生效】 ======
     if (request.method === 'POST' && url.pathname === '/admin') {
-        if (!env.KV) {
-            return new Response("未绑定KV", { status: 400 });
+        if (!env || !env.KV) {
+            return jsonResponse({ ok: false, error: '未绑定 KV，配置无法保存' }, 400);
         }
 
         const contentType = request.headers.get('content-type') || '';
+        let rawData;
 
-        if (contentType.includes('application/json')) {
-            try {
-                const textData = await request.text();
-                const data = JSON.parse(textData);
-                if (typeof data.links !== 'string' || typeof data.customNodes !== 'string' || !data.config || typeof data.config !== 'object' || Array.isArray(data.config)) throw new Error('配置数据格式错误');
-                const limit = Number(data.config.outputLimit || 0);
-                if (!Number.isInteger(limit) || limit < 0 || limit > 100000) throw new Error('节点数量限制须为 0 至 100000 的整数');
-                if (data.config.favorites !== undefined && (!Array.isArray(data.config.favorites) || data.config.favorites.some(x => typeof x !== 'string'))) throw new Error('收藏节点数据格式错误');
-                const snapshot = JSON.stringify({ version: 1, links: data.links, customNodes: data.customNodes, config: data.config, committedAt: new Date().toISOString() });
-                await env.KV.put('CONFIG_SNAPSHOT.json', snapshot);
-                // 兼容旧版本后台/订阅入口；正式订阅优先读取上方单键提交快照。
-                await Promise.allSettled([env.KV.put('LINK.txt', data.links), env.KV.put('CUSTOM_NODES.txt', data.customNodes), env.KV.put('EDIT_CONFIG.json', JSON.stringify(data.config))]);
-
-                return new Response(JSON.stringify({ ok: true, committedAt: JSON.parse(snapshot).committedAt }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-            } catch (e) {
-                return new Response("JSON 解析异常: " + e.message, { status: 400 });
+        try {
+            if (contentType.includes('application/json')) {
+                rawData = await request.json();
+            } else {
+                // 兼容旧版纯文本保存
+                const txt = await request.text();
+                rawData = { links: txt };
             }
-        } else {
-            const content = await request.text();
-            await env.KV.put('LINK.txt', content);
-            return new Response("保存成功", { status: 200 });
+        } catch (e) {
+            return jsonResponse({ ok: false, error: '请求体解析失败：' + e.message }, 400);
         }
+
+        let cfg;
+        try {
+            cfg = normalizeIncoming(rawData);
+        } catch (e) {
+            return jsonResponse({ ok: false, error: e.message }, 400);
+        }
+
+        let current;
+        try {
+            current = await loadConfig(env, false);
+        } catch (e) {
+            current = defaultConfig();
+        }
+
+        let warning = '';
+        const baseVersion = Number(rawData.version) || 0;
+        if (current.version && baseVersion && current.version !== baseVersion) {
+            warning = `检测到配置已在其他页面被修改（当前版本 ${current.version}，本次基于 ${baseVersion} 提交），已按本次内容覆盖。`;
+        }
+
+        cfg.version = (Number(current.version) || 0) + 1;
+        cfg.savedAt = new Date().toISOString();
+
+        try {
+            // 单键写入 = 原子提交，杜绝"部分模块成功、部分失败"却报全部成功
+            await env.KV.put(KV_SNAPSHOT_KEY, JSON.stringify(snapshotFor(cfg)));
+        } catch (e) {
+            return jsonResponse({ ok: false, error: '写入 KV 失败：' + e.message }, 500);
+        }
+
+        // 兼容旧键镜像（失败不影响已生效的快照）
+        try {
+            await env.KV.put('LINK.txt', cfg.links);
+            await env.KV.put('CUSTOM_NODES.txt', cfg.customNodes);
+            await env.KV.put('EDIT_CONFIG.json', JSON.stringify(cfg.rules));
+        } catch (e) {
+            console.error('兼容键镜像写入失败（不影响正式配置）:', e);
+        }
+
+        return jsonResponse({
+            ok: true,
+            version: cfg.version,
+            savedAt: cfg.savedAt,
+            warning: warning
+        }, 200);
     }
 
-    let content = '';
-    let customNodes = '';
-    let configObj = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG);
-    let hasKV = !!env.KV;
+    // ====== 页面渲染：读取正式生效配置 ======
+    const hasKV = !!(env && env.KV);
+    let cfg;
 
     if (hasKV) {
-        content = await env.KV.get('LINK.txt') || '';
-        customNodes = await env.KV.get('CUSTOM_NODES.txt') || '';
-
-        let kvCfg = await env.KV.get('EDIT_CONFIG.json');
-
-        if (kvCfg) {
-            try {
-                Object.assign(configObj, JSON.parse(kvCfg));
-            } catch (e) {}
-        }
+        cfg = await loadConfig(env, true);
+    } else {
+        cfg = defaultConfig();
+        cfg.links = (env && env.LINK) || '';
     }
 
     return new Response(
-        renderDashboardHTML(
-            content,
-            customNodes,
-            configObj,
-            guest,
-            url,
-            mytoken,
-            FileName,
-            hasKV,
-            subProtocol,
-            subConverter,
-            subConfig,
-            userAgentHeader
-        ),
+        renderDashboardHTML({
+            cfg: cfg,
+            guest: guest,
+            url: url,
+            mytoken: mytoken,
+            FileName: FileName,
+            hasKV: hasKV,
+            subProtocol: subProtocol,
+            subConverter: subConverter,
+            subConfig: subConfig
+        }),
         {
             headers: {
                 "Content-Type": "text/html;charset=utf-8",
@@ -836,124 +1489,269 @@ async function handleAdminUI(
 }
 
 
-const globalCSS = `
-<style>
-    :root {
-        --glass-bg: rgba(17, 25, 40, 0.6);
-        --glass-border: rgba(255, 255, 255, 0.125);
-        --neon-cyan: #00f3ff;
-        --neon-purple: #b026ff;
-    }
-
+// ================= 全局样式 =================
+const globalCSS = `<style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
     body {
-        background-color: #0f172a;
-        color: #e2e8f0;
+        background: #080d18;
+        background-image:
+            radial-gradient(900px 420px at 8% -6%, rgba(34, 211, 238, 0.10), transparent 60%),
+            radial-gradient(760px 380px at 96% 0%, rgba(168, 85, 247, 0.10), transparent 62%);
+        background-repeat: no-repeat;
+        color: #e6edf7;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", Arial, sans-serif;
+        font-size: 14px;
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-decoration: none; }
+    .topbar {
+        position: sticky; top: 0; z-index: 60;
+        background: rgba(8, 13, 24, 0.88);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border-bottom: 1px solid #1a2740;
+    }
+    .topbar-in {
+        max-width: 1440px; margin: 0 auto; padding: 10px 20px;
+        display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand-mark {
+        width: 30px; height: 30px; border-radius: 9px;
+        display: flex; align-items: center; justify-content: center;
+        background: linear-gradient(135deg, #0ea5e9, #6366f1);
+        box-shadow: 0 0 18px rgba(14, 165, 233, 0.35);
+        font-size: 15px;
+    }
+    .brand-name { font-size: 14px; font-weight: 700; letter-spacing: 0.06em; }
+    .brand-sub { font-size: 10px; color: #64748b; letter-spacing: 0.16em; text-transform: uppercase; }
+    .clocks { display: flex; gap: 18px; margin-left: auto; }
+    .clock { display: flex; flex-direction: column; line-height: 1.25; }
+    .clock b { font-size: 9px; color: #64748b; letter-spacing: 0.16em; font-weight: 600; }
+    .clock span {
+        font-size: 12.5px; color: #cfe0f5; letter-spacing: 0.02em;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+    }
+    .top-actions { display: flex; align-items: center; gap: 10px; }
+    .gstatus { font-size: 11px; color: #94a3b8; }
+    .gstatus.warn { color: #fbbf24; }
+    .gstatus.ok { color: #34d399; }
+    .gstatus.error { color: #f87171; }
+    .gstatus.busy { color: #60a5fa; }
+
+    .wrap {
+        max-width: 1440px; margin: 0 auto; padding: 18px 20px 60px;
+        display: grid; grid-template-columns: minmax(0, 1fr) 348px; gap: 16px;
+        align-items: start;
+    }
+    @media (max-width: 1180px) { .wrap { grid-template-columns: minmax(0, 1fr); } }
+    main { min-width: 0; }
+    aside { min-width: 0; }
+
+    .card {
+        background: #0d1526;
+        border: 1px solid #1b2740;
+        border-radius: 14px;
+        box-shadow: 0 12px 34px rgba(0, 0, 0, 0.22);
+        overflow: hidden;
+    }
+    .card + .card { margin-top: 16px; }
+    .card-head {
+        display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        padding: 11px 14px;
+        background: #111b2e;
+        border-bottom: 1px solid #1b2740;
+    }
+    .card-head h2 { margin: 0; font-size: 14.5px; font-weight: 700; letter-spacing: 0.02em; }
+    .card-body { padding: 14px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #22d3ee; box-shadow: 0 0 10px #22d3ee; }
+    .chip {
+        font-size: 9.5px; padding: 2px 7px; border-radius: 999px;
+        border: 1px solid #2b3d5c; color: #7f93b3; letter-spacing: 0.1em; text-transform: uppercase;
+    }
+    .card-actions { margin-left: auto; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+    .mod-status { font-size: 10.5px; color: #64748b; margin-right: 3px; white-space: nowrap; }
+    .mod-status.ok { color: #34d399; }
+    .mod-status.warn { color: #fbbf24; }
+    .mod-status.info { color: #60a5fa; }
+    .mod-status.error { color: #f87171; }
+    .mod-status.busy { color: #a78bfa; }
+
+    .btn {
+        appearance: none; -webkit-appearance: none;
+        border: 1px solid #26364f; background: #16233a; color: #d7e5f8;
+        font-family: inherit; font-size: 12px; font-weight: 600;
+        padding: 6px 11px; border-radius: 8px; cursor: pointer;
+        transition: background .15s, border-color .15s, transform .1s, filter .15s;
+        white-space: nowrap;
+    }
+    .btn:hover:not(:disabled) { background: #1d2d47; border-color: #3d5a86; }
+    .btn:active:not(:disabled) { transform: translateY(1px); }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .btn.green { background: linear-gradient(135deg, #0ea5e9, #22d3ee); border-color: transparent; color: #04111f; font-weight: 700; }
+    .btn.green:hover:not(:disabled) { filter: brightness(1.08); }
+    .btn.primary { background: linear-gradient(135deg, #4f46e5, #06b6d4); border-color: transparent; color: #f2fbff; }
+    .btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
+    .btn.accent { background: #10263f; border-color: #2f5378; color: #7dd3fc; }
+    .btn.danger { background: #2a1420; border-color: #6d2740; color: #fda4af; }
+    .btn.ghost { background: transparent; border-color: #24334c; color: #9fb3cf; }
+    .btn.sm { padding: 4px 9px; font-size: 11px; border-radius: 7px; }
+
+    .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .field > label { font-size: 10.5px; color: #7f93b3; letter-spacing: 0.02em; }
+    input[type="text"], input[type="number"], input[type="password"], textarea, select {
+        width: 100%; background: #0a1220; border: 1px solid #22314a; border-radius: 8px;
+        color: #e6edf7; font-family: inherit; font-size: 12.5px; padding: 7px 10px;
+        outline: none; transition: border-color .15s, box-shadow .15s;
+    }
+    input[type="text"]:focus, input[type="number"]:focus, input[type="password"]:focus, textarea:focus, select:focus {
+        border-color: #22d3ee; box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12);
+    }
+    textarea { resize: vertical; line-height: 1.6; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    input::placeholder, textarea::placeholder { color: #465b78; }
+    input[type="checkbox"] { accent-color: #22d3ee; width: 14px; height: 14px; cursor: pointer; }
+
+    .mt8 { margin-top: 8px; }
+    .mt10 { margin-top: 10px; }
+    .mt12 { margin-top: 12px; }
+    .mt14 { margin-top: 14px; }
+    .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .hint { font-size: 10.5px; color: #64748b; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .checks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 14px; }
+    .check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #c2d3e8; cursor: pointer; user-select: none; }
+    .act-row { display: flex; gap: 7px; align-items: stretch; }
+    .act-row > input { flex: 1 1 auto; min-width: 0; }
+    .act-row > .btn { flex: 0 0 auto; }
+    .divider { height: 1px; background: #1b2740; margin: 12px 0; }
+
+    .src-report { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+    .src-item {
+        display: flex; gap: 8px; align-items: flex-start;
+        font-size: 11px; padding: 6px 9px; border-radius: 8px;
+        background: #0a1220; border: 1px solid #1e2c45; color: #9fb3cf;
+        word-break: break-all;
+    }
+    .src-item.bad { border-color: #5a2130; background: #180d13; color: #fca5a5; }
+    .src-item.good { border-color: #1c4136; background: #0a1a16; color: #86efac; }
+    .src-tag { flex: 0 0 auto; font-weight: 700; font-size: 9.5px; letter-spacing: 0.08em; padding: 1px 6px; border-radius: 5px; background: #1c2b44; color: #93a9c8; }
+    .src-item.bad .src-tag { background: #4a1a26; color: #fda4af; }
+    .src-item.good .src-tag { background: #14372b; color: #6ee7b7; }
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 7px; margin-bottom: 10px; }
+    .stat { background: #0a1220; border: 1px solid #1e2c45; border-radius: 9px; padding: 6px 9px; }
+    .stat b { display: block; font-size: 15px; color: #7dd3fc; font-variant-numeric: tabular-nums; line-height: 1.25; }
+    .stat span { font-size: 10px; color: #64748b; }
+    .stat.warn b { color: #fbbf24; }
+
+    .opbar {
+        display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+        font-size: 11px; color: #9fb3cf; background: #0a1220;
+        border: 1px dashed #24344f; border-radius: 9px; padding: 7px 10px; margin-bottom: 10px;
     }
 
-    .orb {
-        position: fixed;
-        border-radius: 50%;
-        filter: blur(100px);
-        opacity: 0.4;
-        z-index: -1;
-        animation: float 10s infinite ease-in-out alternate;
+    .nodelist {
+        list-style: none; margin: 0; padding: 0;
+        max-height: 560px; overflow-y: auto;
+        display: flex; flex-direction: column; gap: 5px;
     }
+    .node {
+        display: flex; gap: 8px; align-items: flex-start;
+        padding: 8px 10px; border: 1px solid #1e2c45; border-radius: 9px;
+        background: #0a1220; transition: border-color .15s, background .15s;
+    }
+    .node:hover { border-color: #2f4670; background: #0c1727; }
+    .node.is-fav { border-color: #8a6414; background: #17130a; }
+    .node.is-off { opacity: .4; }
+    .node-main { min-width: 0; flex: 1 1 auto; }
+    .node-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 3px; }
+    .badge {
+        font-size: 9px; padding: 1px 5px; border-radius: 4px;
+        border: 1px solid #2b3d5c; color: #9bb0cc;
+        text-transform: uppercase; letter-spacing: 0.06em; background: #101c30;
+    }
+    .badge.custom { border-color: #6b2a63; color: #f0abfc; background: #1c1020; }
+    .badge.info { border-color: #2f5378; color: #7dd3fc; }
+    .badge.fav { border-color: #8a6414; color: #fcd34d; background: #1c1508; }
+    .badge.off { border-color: #3a2a2a; color: #b08080; }
+    .node-old { font-size: 10.5px; color: #5c708c; text-decoration: line-through; word-break: break-all; }
+    .node-name { font-size: 12.5px; font-weight: 600; color: #eaf4ff; word-break: break-all; }
+    .node-raw {
+        font-size: 9.5px; color: #3f5570; margin-top: 3px; word-break: break-all;
+        max-height: 0; overflow: hidden; transition: max-height .18s ease;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .node:hover .node-raw { max-height: 46px; }
+    .star { background: none; border: none; cursor: pointer; font-size: 15px; line-height: 1; color: #3d4f6b; padding: 1px 3px; flex: 0 0 auto; }
+    .star:hover { color: #fbbf24; }
+    .star.on { color: #fbbf24; text-shadow: 0 0 9px rgba(251, 191, 36, 0.55); }
+    .pick { margin-top: 3px; flex: 0 0 auto; }
 
-    .orb-1 {
-        width: 400px;
-        height: 400px;
-        background: var(--neon-cyan);
-        top: -100px;
-        left: -100px;
-    }
+    .empty { padding: 26px 12px; text-align: center; color: #5c708c; font-size: 12px; }
 
-    .orb-2 {
-        width: 500px;
-        height: 500px;
-        background: var(--neon-purple);
-        bottom: -100px;
-        right: -100px;
-        animation-delay: -5s;
-    }
+    .collapse-head { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+    .collapse-head h2 { margin: 0; font-size: 13.5px; font-weight: 700; }
+    .collapse-arrow { margin-left: auto; font-size: 10px; color: #64748b; border: 1px solid #24334c; border-radius: 6px; padding: 1px 7px; }
+    .collapse-body { display: none; margin-top: 12px; }
+    .card.open .collapse-body { display: block; }
 
-    .orb-3 {
-        width: 300px;
-        height: 300px;
-        background: #ff0055;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        animation-delay: -2s;
-        opacity: 0.2;
+    .subgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .subcard {
+        background: #0a1220; border: 1px solid #1e2c45; border-radius: 10px;
+        padding: 8px; cursor: pointer; transition: border-color .15s, background .15s;
+        display: flex; flex-direction: column; gap: 6px; min-width: 0;
     }
+    .subcard:hover { border-color: #22d3ee; background: #0c1a2a; }
+    .subcard-tag { font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #7dd3fc; }
+    .subcard-qr { align-self: center; background: #fff; padding: 3px; border-radius: 5px; line-height: 0; }
+    .subcard-url { font-size: 8.5px; color: #465b78; word-break: break-all; text-align: center; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .kv { display: flex; gap: 6px; font-size: 11px; color: #8fa1bd; word-break: break-all; }
+    .kv b { color: #a78bfa; flex: 0 0 auto; }
 
-    @keyframes float {
-        0% { transform: translate(0, 0) scale(1); }
-        100% { transform: translate(30px, 50px) scale(1.1); }
+    .toast-wrap { position: fixed; top: 62px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+    .toast {
+        min-width: 190px; max-width: 380px;
+        background: #101c30; border: 1px solid #22d3ee; border-left-width: 3px;
+        color: #e6edf7; font-size: 12px; font-weight: 600;
+        padding: 9px 13px; border-radius: 9px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+        transform: translateX(120%); opacity: 0;
+        transition: transform .25s ease, opacity .25s ease;
+        word-break: break-word;
     }
+    .toast.show { transform: translateX(0); opacity: 1; }
+    .toast.error { border-color: #ef4444; }
+    .toast.warn { border-color: #f59e0b; }
 
-    .glass-card {
-        background-color: var(--glass-bg);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid var(--glass-border);
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+    .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .login-card {
+        width: 100%; max-width: 372px; background: #0d1526;
+        border: 1px solid #1b2740; border-radius: 16px; padding: 28px 26px 24px;
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
     }
+    .login-title { font-size: 19px; font-weight: 700; letter-spacing: 0.06em; margin: 0 0 4px; }
+    .login-sub { font-size: 10.5px; color: #64748b; letter-spacing: 0.18em; text-transform: uppercase; margin: 0 0 22px; }
+    .login-err {
+        background: #2a1420; border: 1px solid #6d2740; color: #fda4af;
+        font-size: 12px; padding: 8px 11px; border-radius: 8px; margin-bottom: 14px;
+    }
+    .login-btn {
+        width: 100%; margin-top: 18px; padding: 10px; border: none; border-radius: 9px;
+        background: linear-gradient(135deg, #4f46e5, #06b6d4); color: #f2fbff;
+        font-family: inherit; font-size: 12.5px; font-weight: 700; letter-spacing: 0.1em;
+        cursor: pointer; transition: filter .15s;
+    }
+    .login-btn:hover { filter: brightness(1.1); }
 
-    .glass-input {
-        background: rgba(0, 0, 0, 0.2);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        color: #fff;
-        transition: all 0.3s;
-    }
-
-    .glass-input:focus {
-        border-color: var(--neon-cyan);
-        box-shadow: 0 0 15px rgba(0, 243, 255, 0.3);
-        outline: none;
-    }
-
-    .neon-text-cyan {
-        color: var(--neon-cyan);
-        text-shadow: 0 0 8px rgba(0, 243, 255, 0.5);
-    }
-
-    .neon-text-purple {
-        color: #d980ff;
-        text-shadow: 0 0 8px rgba(176, 38, 255, 0.5);
-    }
-
-    .neon-btn {
-        background: linear-gradient(45deg, #00f3ff, #0088ff);
-        color: #000;
-        box-shadow: 0 0 15px rgba(0, 243, 255, 0.4);
-        transition: all 0.3s;
-        border: none;
-    }
-
-    .neon-btn:hover {
-        box-shadow: 0 0 25px rgba(0, 243, 255, 0.7);
-        transform: translateY(-2px);
-    }
-
-    ::-webkit-scrollbar {
-        width: 8px;
-    }
-
-    ::-webkit-scrollbar-track {
-        background: rgba(0,0,0,0.1);
-    }
-
-    ::-webkit-scrollbar-thumb {
-        background: rgba(255,255,255,0.2);
-        border-radius: 4px;
-    }
-
-    ::-webkit-scrollbar-thumb:hover {
-        background: rgba(255,255,255,0.4);
-    }
-</style>
-`;
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #0a1220; }
+    ::-webkit-scrollbar-thumb { background: #26364f; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3d5a86; }
+</style>`;
 
 
 function renderLoginHTML(isError = false) {
@@ -963,787 +1761,1598 @@ function renderLoginHTML(isError = false) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>系统后台登录</title>
-    <script src="https://cdn.tailwindcss.com"></script>
     ${globalCSS}
 </head>
-<body class="h-screen flex items-center justify-center relative overflow-hidden">
-    <div class="orb orb-1"></div>
-    <div class="orb orb-2"></div>
+<body>
+    <div class="login-wrap">
+        <div class="login-card">
+            <h1 class="login-title">NODE <span style="color:#22d3ee">HUB</span></h1>
+            <p class="login-sub">Secure Aggregation Console</p>
 
-    <div class="glass-card p-10 rounded-3xl shadow-2xl w-96 relative z-10 border-t border-l border-white/20">
-        <div class="mb-8 text-center">
-            <h1 class="text-3xl font-bold text-white tracking-wider drop-shadow-md">
-                NODE<span class="neon-text-cyan"> HUB</span>
-            </h1>
-            <p class="text-sm text-gray-400 mt-2">安全聚合控制台</p>
+            ${isError ? '<div class="login-err">账号或密码错误，请重试</div>' : ''}
+
+            <form action="/login" method="POST">
+                <div class="field">
+                    <label>用户名</label>
+                    <input type="text" name="username" placeholder="请输入用户名" required>
+                </div>
+                <div class="field mt12">
+                    <label>密码</label>
+                    <input type="password" name="password" placeholder="请输入密码" required>
+                </div>
+                <button type="submit" class="login-btn">授权登录</button>
+            </form>
         </div>
-
-        ${isError ? '<div class="bg-red-500/20 border border-red-500/50 text-red-300 p-3 mb-6 text-sm rounded backdrop-blur-md">账号或密码错误，请重试</div>' : ''}
-
-        <form action="/login" method="POST" class="space-y-6">
-            <div>
-                <label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 用户名 </label>
-                <input type="text" name="username" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入用户名" required>
-            </div>
-
-            <div>
-                <label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 密码 </label>
-                <input type="password" name="password" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入密码" required>
-            </div>
-
-            <button type="submit" class="neon-btn w-full font-bold py-3 px-4 rounded-xl mt-4 uppercase tracking-widest text-sm">
-                授权登录 LOGIN
-            </button>
-        </form>
     </div>
 </body>
 </html>`;
 }
 
 
-function renderDashboardHTML(
-    content,
-    customNodes,
-    configObj,
-    guest,
-    url,
-    mytoken,
-    FileName,
-    hasKV,
-    subProtocol,
-    subConverter,
-    subConfig,
-    userAgentHeader
-) {
-    const subItems = [
-        {
-            name: '自适应',
-            path: `/${mytoken}?sub`,
-            badge: 'bg-blue-500/20 text-blue-300 border-blue-500/30'
-        },
-        {
-            name: 'Base64',
-            path: `/${mytoken}?b64`,
-            badge: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30'
-        },
-        {
-            name: 'Clash',
-            path: `/${mytoken}?clash`,
-            badge: 'bg-pink-500/20 text-pink-300 border-pink-500/30'
-        },
-        {
-            name: 'Singbox',
-            path: `/${mytoken}?sb`,
-            badge: 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+function renderDashboardHTML(ctx) {
+    const cfg = ctx.cfg;
+    const guest = ctx.guest;
+    const url = ctx.url;
+    const mytoken = ctx.mytoken;
+    const FileName = ctx.FileName;
+    const hasKV = ctx.hasKV;
+    const subProtocol = ctx.subProtocol;
+    const subConverter = ctx.subConverter;
+    const subConfig = ctx.subConfig;
+
+    const rules = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG, cfg.rules || {});
+    const output = cfg.output || { limitEnabled: false, limit: 0 };
+    const previewState = cfg.preview || { keyword: '', onlyFav: false };
+
+    const boot = {
+        version: cfg.version || 0,
+        savedAt: cfg.savedAt || '',
+        hasKV: hasKV,
+        seed: dailySeed(),
+        config: {
+            links: cfg.links || '',
+            customNodes: cfg.customNodes || '',
+            rules: rules,
+            output: output,
+            favorites: cfg.favorites || [],
+            preview: previewState
         }
+    };
+
+    const subItems = [
+        { name: '自适应', path: `/${mytoken}?sub`, tag: 'AUTO' },
+        { name: 'Base64', path: `/${mytoken}?b64`, tag: 'BASE64' },
+        { name: 'Clash', path: `/${mytoken}?clash`, tag: 'CLASH' },
+        { name: 'Singbox', path: `/${mytoken}?sb`, tag: 'SINGBOX' }
     ];
 
-    const generateSubCard = (item, prefix) => `
-        <div class="glass-card rounded-xl p-4 flex flex-col justify-between hover:border-[var(--neon-cyan)] hover:shadow-[0_0_15px_rgba(0,243,255,0.2)] transition-all duration-300 group cursor-pointer" onclick="copyTo('${url.origin}${item.path}')">
-            <div class="flex justify-between items-start mb-3">
-                <span class="px-2.5 py-1 text-[10px] font-bold rounded border ${item.badge} tracking-wider uppercase">${item.name}</span>
-                <span class="text-gray-500 group-hover:text-[var(--neon-cyan)] transition">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-                    </svg>
-                </span>
-            </div>
-
-            <div class="flex flex-col items-center">
-                <div class="p-1.5 bg-white/90 rounded-lg shadow-sm group-hover:shadow-[0_0_10px_#fff] transition">
-                    <div id="${prefix}_${item.name}"></div>
-                </div>
-                <p class="text-[9px] text-gray-500 mt-3 truncate w-full text-center group-hover:text-gray-300 font-mono">
-                    ${url.origin}${item.path}
-                </p>
-            </div>
+    const subCard = (item, prefix) => `
+        <div class="subcard" data-copy="${escHtml(url.origin + item.path)}" title="点击复制订阅地址">
+            <span class="subcard-tag">${item.tag}</span>
+            <div class="subcard-qr" id="${prefix}_${item.name}"></div>
+            <div class="subcard-url">${escHtml(item.path)}</div>
         </div>
     `;
+
+    const guestItems = subItems.map(item => ({
+        name: item.name,
+        tag: item.tag,
+        path: `/sub?token=${guest}${item.path.split('?')[1] ? '&' + item.path.split('?')[1] : ''}`
+    }));
 
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${FileName} - Node Editor Pro</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>${escHtml(FileName)} - Node Console</title>
     <script src="https://cdn.jsdelivr.net/npm/@keeex/qrcodejs-kx@1.0.2/qrcode.min.js"></script>
     ${globalCSS}
 </head>
-<body class="relative min-h-screen pb-10 overflow-x-hidden">
-    <div id="toast-container" class="fixed top-6 right-6 z-[9999] flex flex-col gap-3 pointer-events-none"></div>
-    <div class="orb orb-1"></div>
-    <div class="orb orb-2"></div>
-    <div class="orb orb-3"></div>
+<body>
+<div class="toast-wrap" id="toastWrap"></div>
 
-    <script>
-        // 前端保存独立状态
-        window.CURRENT_SPECIFIC_RULES = ${JSON.stringify(configObj.specificRules || {})};
-    </script>
-
-    <nav class="glass-card sticky top-0 z-50 border-b-0 border-white/10 mb-8 rounded-b-3xl">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-full flex items-center justify-center border border-[var(--neon-cyan)] shadow-[0_0_10px_rgba(0,243,255,0.3)] bg-black/30">
-                    <svg class="w-5 h-5 text-[var(--neon-cyan)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a6 6 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A6 6 0 009 10.172V5L8 4z"></path>
-                    </svg>
-                </div>
-                <h1 class="font-bold text-xl text-white tracking-widest uppercase">${FileName}</h1>
+<header class="topbar">
+    <div class="topbar-in">
+        <div class="brand">
+            <div class="brand-mark">⚡</div>
+            <div>
+                <div class="brand-name">${escHtml(FileName)}</div>
+                <div class="brand-sub">Node Console</div>
             </div>
-
-            <a href="/logout" class="text-xs font-bold text-gray-400 hover:text-red-400 transition uppercase tracking-wider px-4 py-2 glass-card rounded-full hover:border-red-500/50">
-                登出 LOGOUT
-            </a>
-        </div>
-    </nav>
-
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-
-        <!-- ================= 整合后的核心控制区 ================= -->
-        <div class="lg:col-span-7 flex flex-col gap-6">
-
-            <!-- 1. 抓取源与全局控制台 -->
-            <div class="glass-card rounded-2xl p-6 flex flex-col">
-                <div class="flex justify-between items-center mb-4">
-                    <div>
-                        <h2 class="text-lg font-bold text-white tracking-wide">节点抓取源 (Sub Links)</h2>
-                        <p class="text-[11px] text-gray-400 mt-1 font-mono">填入需要合并抓取的节点或订阅源</p>
-                    </div>
-
-                    <div class="flex items-center gap-3">
-                        <span id="saveStatus" class="text-xs text-[var(--neon-cyan)] font-mono mr-2"></span>
-
-                        <button
-                            id="restoreBtn"
-                            type="button"
-                            onclick="if (confirm('确定放弃当前所有未保存修改，并恢复到上次保存的整体配置吗？')) window.location.reload();"
-                            class="flex items-center justify-center h-10 px-4 gap-2 rounded-xl text-sm font-bold text-gray-300 border border-gray-600 hover:text-white hover:border-red-500/50 hover:bg-red-500/10 transition-all bg-black/20 cursor-pointer"
-                            title="放弃未保存的修改，重新读取 KV 中已保存的整体配置"
-                        >
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                            </svg>
-                            取消恢复（整体配置）
-                        </button>
-
-                        <button id="saveBtn" class="neon-btn flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-black cursor-pointer shadow-[0_0_15px_rgba(0,243,255,0.4)]">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path>
-                            </svg>
-                            保存配置(最终生效)
-                        </button>
-                    </div>
-                </div>
-
-                ${hasKV ? `<textarea id="content" class="glass-input w-full p-4 h-[120px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-green-400" placeholder="# 粘贴原始节点或订阅链接...">${content}</textarea>` : '<div class="h-[100px] flex items-center justify-center bg-red-900/20 text-red-400 font-medium rounded-xl">未绑定 KV，功能不可用</div>'}
-            </div>
-
-            ${hasKV ? `
-            <!-- 2. 二次编辑规则 -->
-            <div class="glass-card rounded-2xl p-6 relative">
-                <div class="flex justify-between items-center mb-4 border-b border-white/10 pb-4">
-                    <div>
-                        <h2 class="text-lg font-bold text-white tracking-wide">节点二次编辑规则 (Rules)</h2>
-                        <p class="text-[11px] text-gray-400 mt-1 font-mono">配置好规则后，点击右侧的【应用配置并预览】即可立刻查看真实效果</p>
-                    </div>
-
-                    <button id="previewBtn" class="glass-card flex items-center justify-center h-10 px-4 gap-2 rounded-xl text-sm font-bold text-[var(--neon-cyan)] border-[var(--neon-cyan)]/50 hover:bg-[var(--neon-cyan)]/10 transition-all cursor-pointer">
-                        ⚡ 应用配置并预览
-                    </button>
-                </div>
-
-                <div class="grid grid-cols-2 gap-4 mb-5 pb-2">
-                    <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_autoEmoji" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.autoEmoji ? 'checked' : ''}>
-                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">自动地区 Emoji (🇭🇰🇯🇵)</span>
-                    </label>
-
-                    <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_deepDeduplicate" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.deepDeduplicate ? 'checked' : ''}>
-                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">深度去重 (剔同IP端口)</span>
-                    </label>
-
-                    <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_sortNodes" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.sortNodes ? 'checked' : ''}>
-                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">智能排序 (信息置顶)</span>
-                    </label>
-
-                    <label class="flex items-center space-x-2 cursor-pointer group">
-                        <input type="checkbox" id="cfg_dropInvalidNodes" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.dropInvalidNodes ? 'checked' : ''}>
-                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">剔除无效节点(防报错)</span>
-                    </label>
-                </div>
-
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div class="md:col-span-2">
-                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">查找关键字 (在下方预览中将高亮展示被删内容)</label>
-                        <input type="text" id="cfg_replaceTarget" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceTarget || ''}" placeholder="例: @clashV8">
-                    </div>
-
-                    <div class="md:col-span-2">
-                        <label class="text-[10px] text-[var(--neon-purple)] block mb-1">替换为 (留空则代表直接删除查找到的词)</label>
-                        <input type="text" id="cfg_replaceWith" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceWith || ''}" placeholder="例: 星链">
-                    </div>
-
-                    <div>
-                        <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则保留(名称)</label>
-                        <input type="text" id="cfg_retainNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.retainNameRegex || ''}" placeholder="如：香港|日本">
-                    </div>
-
-                    <div>
-                        <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则剔除(名称)</label>
-                        <input type="text" id="cfg_dropNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.dropNameRegex || ''}" placeholder="如：过期|流量">
-                    </div>
-
-                    <div>
-                        <label class="text-[10px] text-gray-400 block mb-1 mt-2">全局重命名(覆盖)</label>
-                        <input type="text" id="cfg_globalRename" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.globalRename || ''}" placeholder="如：专属节点">
-                    </div>
-
-                    <div class="flex gap-2">
-                        <div class="w-1/2">
-                            <label class="text-[10px] text-gray-400 block mb-1 mt-2">统一前缀</label>
-                            <input type="text" id="cfg_addPrefix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addPrefix || ''}" placeholder="如：🚀">
-                        </div>
-
-                        <div class="w-1/2">
-                            <label class="text-[10px] text-gray-400 block mb-1 mt-2">统一后缀</label>
-                            <input type="text" id="cfg_addSuffix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 3. 自定义节点 -->
-            <div class="glass-card rounded-2xl p-6 flex flex-col">
-                <h2 class="text-lg font-bold text-pink-400 mb-1 tracking-wide">自定义输出节点 (Custom Output)</h2>
-                <p class="text-[11px] text-gray-400 mb-4 font-mono">在此填写的节点将<strong class="text-white">不受上方规则限制</strong>，强制追加到订阅末尾</p>
-                <textarea id="customNodes" class="glass-input w-full p-4 h-[80px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴自建节点...">${customNodes}</textarea>
-            </div>
-
-            <!-- 4. 实时节点预览区域 -->
-            <div id="previewSection" class="glass-card rounded-2xl p-6 hidden flex-col border border-[var(--neon-cyan)] shadow-[0_0_20px_rgba(0,243,255,0.15)] mt-2">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-lg font-bold text-[var(--neon-cyan)] tracking-wide flex items-center gap-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
-                        </svg>
-                        实时节点预览 (Live Preview)
-                    </h2>
-
-                    <button onclick="document.getElementById('previewSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xs border border-gray-600 px-3 py-1 rounded-full hover:bg-white/10 transition">
-                        ✕ 关闭
-                    </button>
-                </div>
-
-                <!-- 批量指定前缀后缀工具栏 -->
-                <div class="flex flex-wrap items-center gap-2 mb-4 p-3 bg-black/40 rounded-xl border border-[var(--neon-purple)]/40 shadow-inner">
-                    <span class="text-xs text-gray-300 mr-2 flex items-center gap-1">
-                        <svg class="w-4 h-4 text-[var(--neon-cyan)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
-                        </svg>
-                        已选 <span id="selectedCount" class="text-[var(--neon-cyan)] font-bold text-sm mx-1">0</span> 项
-                    </span>
-
-                    <input type="text" id="batchPrefix" placeholder="指定前缀..." class="glass-input w-24 p-1.5 text-xs rounded">
-                    <input type="text" id="batchSuffix" placeholder="指定后缀..." class="glass-input w-24 p-1.5 text-xs rounded">
-                    <button id="applyBatchBtn" class="neon-btn px-3 py-1.5 rounded text-xs font-bold text-black shadow-md ml-auto">对选中项应用</button>
-                    <button id="clearBatchBtn" class="border border-red-500/50 text-red-400 hover:bg-red-500/20 px-3 py-1.5 rounded text-xs transition">清除专有规则</button>
-                </div>
-
-                <div id="previewContent" class="w-full h-[400px] rounded-xl overflow-y-auto pr-2 custom-scrollbar"></div>
-            </div>
-
-            ` : ''}
         </div>
 
-        <!-- ================= 侧边辅助与分发区 ================= -->
-        <div class="lg:col-span-5 flex flex-col gap-6">
-            <div class="glass-card rounded-2xl p-6 relative overflow-hidden">
-                <div class="absolute -top-10 -right-10 w-32 h-32 bg-[var(--neon-cyan)] rounded-full mix-blend-screen filter blur-[60px] opacity-20 pointer-events-none"></div>
-                <h2 class="text-lg font-bold text-white mb-1 tracking-wide">专属地址 My Subs</h2>
+        <div class="clocks">
+            <div class="clock"><b>CN 时间</b><span id="clockCN">----</span></div>
+            <div class="clock"><b>UTC 时间</b><span id="clockUTC">----</span></div>
+        </div>
 
-                <div class="grid grid-cols-2 gap-4 mt-5">
-                    ${subItems.map(item => generateSubCard(item, 'qr_my')).join('')}
-                </div>
-            </div>
-
-            <div class="glass-card rounded-2xl p-6">
-                <div class="flex justify-between items-center cursor-pointer group" onclick="toggleNotice()">
-                    <div>
-                        <h2 class="text-md font-bold text-white tracking-wide">访客订阅 Guest Subs</h2>
-                    </div>
-                    <span id="noticeToggle" class="text-gray-500 font-mono text-xs border border-white/10 px-3 py-1 rounded-full bg-black/20">展开 ▼</span>
-                </div>
-
-                <div id="noticeContent" class="hidden mt-5 border-t border-white/10 pt-5">
-                    <div class="mb-5 bg-black/40 p-3 rounded-xl border border-[var(--neon-purple)]/30">
-                        <span class="text-xs text-gray-400">TOKEN: </span>
-                        <strong class="neon-text-purple font-mono text-xs tracking-wider">${guest}</strong>
-                    </div>
-
-                    <div class="grid grid-cols-2 gap-4 opacity-70 hover:opacity-100 transition duration-500">
-                        ${subItems.map(item => generateSubCard({
-                            ...item,
-                            path: `/sub?token=${guest}${item.path.split('?')[1] ? '&' + item.path.split('?')[1] : ''}`
-                        }, 'qr_guest')).join('')}
-                    </div>
-                </div>
-            </div>
-
-            <div class="glass-card rounded-2xl p-5 text-xs font-mono text-gray-400">
-                <div class="space-y-2">
-                    <p>
-                        <span class="text-[var(--neon-purple)] font-bold">SUBAPI:</span>
-                        <span class="text-gray-300">${subProtocol}://${subConverter}</span>
-                    </p>
-                    <p>
-                        <span class="text-[var(--neon-purple)] font-bold">CONFIG:</span>
-                        <span class="text-gray-300 break-all">${subConfig}</span>
-                    </p>
-                </div>
-            </div>
+        <div class="top-actions">
+            <span class="gstatus" id="globalStatus">未修改</span>
+            <button class="btn primary" id="btnGlobalSave">保存所有配置</button>
+            <a href="/logout" class="btn ghost">登出</a>
         </div>
     </div>
+</header>
 
-    <script>
-        function showToast(message, type='success') {
-            const container = document.getElementById('toast-container');
-            if (!container) return;
+<div class="wrap">
+    <main>
 
-            const toast = document.createElement('div');
-            let borderColor = type === 'success' ? 'var(--neon-cyan)' : '#ff4757';
+        <!-- ============ 模块 1：节点抓取源 ============ -->
+        <section class="card" id="card-links">
+            <div class="card-head">
+                <span class="dot"></span>
+                <h2>节点抓取源</h2>
+                <span class="chip">Sub Links</span>
+                <div class="card-actions">
+                    <span class="mod-status" id="st-links">未修改</span>
+                    <button class="btn sm" data-act="undo" data-mod="links" disabled>撤销</button>
+                    <button class="btn sm" data-act="redo" data-mod="links" disabled>重做</button>
+                    <button class="btn sm" data-act="revert" data-mod="links">取消恢复</button>
+                    <button class="btn sm accent" data-act="module-save" data-mod="links">保存配置</button>
+                </div>
+            </div>
+            <div class="card-body" id="body-links">
+                ${hasKV ? `
+                <textarea id="ta_links" rows="5" spellcheck="false" placeholder="每行一个订阅链接，或直接粘贴明文节点&#10;https://example.com/sub?token=xxx&#10;vless://...#香港01">${escHtml(cfg.links || '')}</textarea>
+                <div class="row mt10">
+                    <button class="btn green" id="btnFetch">抓取并预览</button>
+                    <span class="hint">明文节点与远程订阅可混填；逐个链接独立抓取，单条失败不影响其他</span>
+                </div>
+                <div class="src-report" id="srcReport"></div>
+                ` : '<div class="empty" style="color:#f87171">未绑定 KV，配置无法读取与保存</div>'}
+            </div>
+        </section>
 
-            toast.className = \`glass-card px-5 py-3 rounded-xl border border-[\${borderColor}] shadow-[0_0_15px_rgba(0,0,0,0.5)] text-white text-sm font-bold flex items-center gap-3 transform transition-all duration-300 translate-x-[120%] opacity-0\`;
-            toast.innerHTML = \`<span class="text-[\${borderColor}] text-lg leading-none">\${type==='success'?'✓':'✕'}</span> \${message}\`;
+        <!-- ============ 模块 2：节点二次编辑规则 ============ -->
+        <section class="card" id="card-rules">
+            <div class="card-head">
+                <span class="dot"></span>
+                <h2>节点二次编辑规则</h2>
+                <span class="chip">Rules</span>
+                <div class="card-actions">
+                    <span class="mod-status" id="st-rules">未修改</span>
+                    <button class="btn sm" data-act="undo" data-mod="rules" disabled>撤销</button>
+                    <button class="btn sm" data-act="redo" data-mod="rules" disabled>重做</button>
+                    <button class="btn sm" data-act="revert" data-mod="rules">取消恢复</button>
+                    <button class="btn sm accent" data-act="module-save" data-mod="rules">保存配置</button>
+                </div>
+            </div>
+            <div class="card-body" id="body-rules">
 
-            container.appendChild(toast);
+                <div class="checks">
+                    <label class="check"><input type="checkbox" id="chk_autoEmoji" ${rules.autoEmoji ? 'checked' : ''}> 自动地区 Emoji</label>
+                    <label class="check"><input type="checkbox" id="chk_deepDeduplicate" ${rules.deepDeduplicate ? 'checked' : ''}> 深度去重（同 IP 端口）</label>
+                    <label class="check"><input type="checkbox" id="chk_sortNodes" ${rules.sortNodes ? 'checked' : ''}> 智能排序（信息置顶）</label>
+                    <label class="check"><input type="checkbox" id="chk_dropInvalidNodes" ${rules.dropInvalidNodes ? 'checked' : ''}> 剔除无效节点</label>
+                </div>
 
-            requestAnimationFrame(() => {
-                setTimeout(() => {
-                    toast.classList.remove('translate-x-[120%]', 'opacity-0');
-                }, 10);
-            });
+                <div class="divider"></div>
 
-            setTimeout(() => {
-                toast.classList.add('translate-x-[120%]', 'opacity-0');
-                setTimeout(() => toast.remove(), 300);
-            }, 3000);
+                <div class="grid2">
+                    <div class="field">
+                        <label>只保留协议（逗号分隔，留空不限制）</label>
+                        <input type="text" id="in_retainProtocols" value="${escHtml((rules.retainProtocols || []).join(','))}" placeholder="vmess,vless,trojan">
+                    </div>
+                    <div class="field">
+                        <label>剔除协议（逗号分隔，留空不限制）</label>
+                        <input type="text" id="in_dropProtocols" value="${escHtml((rules.dropProtocols || []).join(','))}" placeholder="ssr,http">
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="field">
+                    <label>查找关键字（仅临时筛选预览显示，不修改节点）</label>
+                    <div class="act-row">
+                        <input type="text" id="in_keyword" value="${escHtml(previewState.keyword || '')}" placeholder="输入关键字，如 香港">
+                        <button class="btn accent" id="btnSearch">查找</button>
+                        <button class="btn ghost" id="btnClearSearch">清除</button>
+                    </div>
+                </div>
+
+                <div class="grid2 mt10">
+                    <div class="field">
+                        <label>替换：查找内容</label>
+                        <input type="text" id="in_replaceTarget" value="${escHtml(rules.replaceTarget || '')}" placeholder="如 @clashV8">
+                    </div>
+                    <div class="field">
+                        <label>替换：替换为（留空即删除）</label>
+                        <div class="act-row">
+                            <input type="text" id="in_replaceWith" value="${escHtml(rules.replaceWith || '')}" placeholder="如 星链">
+                            <button class="btn accent" id="btnReplace">替换</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="grid2">
+                    <div class="field">
+                        <label>正则保留（节点名称）</label>
+                        <div class="act-row">
+                            <input type="text" id="in_retainNameRegex" value="${escHtml(rules.retainNameRegex || '')}" placeholder="如 香港|日本">
+                            <button class="btn accent" id="btnApplyRetain">执行保留</button>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label>正则剔除（节点名称）</label>
+                        <div class="act-row">
+                            <input type="text" id="in_dropNameRegex" value="${escHtml(rules.dropNameRegex || '')}" placeholder="如 过期|流量">
+                            <button class="btn accent" id="btnApplyDrop">执行剔除</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid3 mt10">
+                    <div class="field">
+                        <label>全局重命名</label>
+                        <div class="act-row">
+                            <input type="text" id="in_globalRename" value="${escHtml(rules.globalRename || '')}" placeholder="如 专属节点">
+                            <button class="btn accent" id="btnApplyRename">执行重命名</button>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label>统一前缀</label>
+                        <div class="act-row">
+                            <input type="text" id="in_addPrefix" value="${escHtml(rules.addPrefix || '')}" placeholder="如 🚀">
+                            <button class="btn accent" id="btnApplyPrefix">添加前缀</button>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label>统一后缀</label>
+                        <div class="act-row">
+                            <input type="text" id="in_addSuffix" value="${escHtml(rules.addSuffix || '')}" placeholder="如 [Pro]">
+                            <button class="btn accent" id="btnApplySuffix">添加后缀</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row mt12">
+                    <button class="btn ghost" id="btnPreviewRefresh">刷新预览</button>
+                    <span class="hint">规则只有点击对应按钮后才会执行，输入过程不会改动节点</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============ 模块 3：实时节点预览 ============ -->
+        <section class="card" id="card-preview">
+            <div class="card-head">
+                <span class="dot" style="background:#a78bfa;box-shadow:0 0 10px #a78bfa"></span>
+                <h2>实时节点预览</h2>
+                <span class="chip">Live Preview</span>
+                <div class="card-actions">
+                    <span class="mod-status" id="st-preview">未修改</span>
+                    <button class="btn sm" data-act="undo" data-mod="preview" disabled>撤销</button>
+                    <button class="btn sm" data-act="redo" data-mod="preview" disabled>重做</button>
+                    <button class="btn sm" data-act="revert" data-mod="preview">取消恢复</button>
+                    <button class="btn sm accent" data-act="module-save" data-mod="preview">保存配置</button>
+                </div>
+            </div>
+            <div class="card-body" id="body-preview">
+
+                <div class="grid3" style="align-items:end">
+                    <div class="field">
+                        <label>输出节点数量（留空或关闭即不限制）</label>
+                        <input type="number" id="in_limit" min="1" step="1" value="${output.limitEnabled ? escHtml(output.limit) : ''}" placeholder="如 50">
+                    </div>
+                    <label class="check" style="height:32px">
+                        <input type="checkbox" id="chk_limitEnabled" ${output.limitEnabled ? 'checked' : ''}> 启用数量限制
+                    </label>
+                    <label class="check" style="height:32px">
+                        <input type="checkbox" id="chk_onlyFav" ${previewState.onlyFav ? 'checked' : ''}> 只看已收藏
+                    </label>
+                </div>
+                <div class="hint mt8" id="limitHint">收藏节点始终优先保留，其余名额从普通节点中随机补足，随机结果按天固定。</div>
+
+                <div class="stats mt12" id="statsBox"></div>
+
+                <div class="opbar" id="opBar">尚未执行任何操作</div>
+
+                <div class="row" style="margin-bottom:8px">
+                    <span class="hint">勾选节点后可为它们单独指定前后缀</span>
+                    <input type="text" id="in_batchPrefix" placeholder="指定前缀" style="width:120px">
+                    <input type="text" id="in_batchSuffix" placeholder="指定后缀" style="width:120px">
+                    <button class="btn sm accent" id="btnBatchApply">对选中项应用</button>
+                    <button class="btn sm danger" id="btnBatchClear">清除专属规则</button>
+                    <span class="hint" id="selCount" style="margin-left:auto">已选 0 项</span>
+                </div>
+
+                <ul class="nodelist" id="nodeList">
+                    <li class="empty">还没有预览数据，请先在「节点抓取源」点击「抓取并预览」</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- ============ 模块 4：自定义输出节点 ============ -->
+        <section class="card" id="card-custom">
+            <div class="card-head">
+                <span class="dot" style="background:#f472b6;box-shadow:0 0 10px #f472b6"></span>
+                <h2>自定义输出节点</h2>
+                <span class="chip">Custom Output</span>
+                <div class="card-actions">
+                    <span class="mod-status" id="st-custom">未修改</span>
+                    <button class="btn sm" data-act="undo" data-mod="custom" disabled>撤销</button>
+                    <button class="btn sm" data-act="redo" data-mod="custom" disabled>重做</button>
+                    <button class="btn sm" data-act="revert" data-mod="custom">取消恢复</button>
+                    <button class="btn sm accent" data-act="module-save" data-mod="custom">保存配置</button>
+                </div>
+            </div>
+            <div class="card-body" id="body-custom">
+                <textarea id="ta_customNodes" rows="4" spellcheck="false" placeholder="每行一个自建节点，不受上方普通过滤规则影响，但会计入最终数量限制">${escHtml(cfg.customNodes || '')}</textarea>
+                <div class="row mt10">
+                    <button class="btn accent" id="btnCustomPreview">更新预览</button>
+                    <span class="hint">自定义节点与远程节点数据隔离，不会互相覆盖</span>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <aside>
+        <section class="card open" id="cardMySubs">
+            <div class="card-head">
+                <div class="collapse-head" style="width:100%" data-toggle="cardMySubs">
+                    <h2>专属地址 My Subs</h2>
+                    <span class="collapse-arrow">收起 ▲</span>
+                </div>
+            </div>
+            <div class="card-body collapse-body">
+                <div class="subgrid">
+                    ${subItems.map(item => subCard(item, 'qr_my')).join('')}
+                </div>
+            </div>
+        </section>
+
+        <section class="card" id="cardGuest">
+            <div class="card-head">
+                <div class="collapse-head" style="width:100%" data-toggle="cardGuest">
+                    <h2>访客订阅 Guest Subs</h2>
+                    <span class="collapse-arrow">展开 ▼</span>
+                </div>
+            </div>
+            <div class="card-body collapse-body">
+                <div class="kv" style="margin-bottom:10px"><b>TOKEN</b><span>${escHtml(guest)}</span></div>
+                <div class="subgrid">
+                    ${guestItems.map(item => subCard(item, 'qr_guest')).join('')}
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head"><h2>运行信息</h2></div>
+            <div class="card-body">
+                <div class="kv" style="margin-bottom:6px"><b>SUBAPI</b><span>${escHtml(subProtocol + '://' + subConverter)}</span></div>
+                <div class="kv" style="margin-bottom:6px"><b>CONFIG</b><span>${escHtml(subConfig)}</span></div>
+                <div class="kv" style="margin-bottom:6px"><b>配置版本</b><span id="verText">v${cfg.version || 0}</span></div>
+                <div class="kv"><b>保存时间</b><span id="savedAtText">${cfg.savedAt ? escHtml(new Date(cfg.savedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })) : '尚未保存'}</span></div>
+            </div>
+        </section>
+    </aside>
+</div>
+
+<script id="boot-data" type="application/json">${safeJSON(boot)}</script>
+
+<script>
+(function () {
+    'use strict';
+
+    var BOOT = JSON.parse(document.getElementById('boot-data').textContent);
+    var MOD_KEYS = ['links', 'rules', 'preview', 'custom'];
+
+    /* ======================= 基础工具 ======================= */
+    function $(id) { return document.getElementById(id); }
+    function valOf(id) { var e = $(id); return e ? e.value : ''; }
+    function checkedOf(id) { var e = $(id); return e ? !!e.checked : false; }
+    function setVal(id, v) { var e = $(id); if (e) e.value = (v === undefined || v === null) ? '' : v; }
+    function setChk(id, v) { var e = $(id); if (e) e.checked = !!v; }
+    function clone(o) { return JSON.parse(JSON.stringify(o === undefined ? null : o)); }
+    function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+    function nowTime() {
+        var d = new Date();
+        return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+    }
+    function esc(s) {
+        return String(s === undefined || s === null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+    function sameJSON(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+    function toast(msg, type, ms) {
+        var wrap = $('toastWrap');
+        if (!wrap) return;
+        var t = document.createElement('div');
+        t.className = 'toast' + (type === 'error' ? ' error' : (type === 'warn' ? ' warn' : ''));
+        t.textContent = msg;
+        wrap.appendChild(t);
+        requestAnimationFrame(function () { t.classList.add('show'); });
+        setTimeout(function () {
+            t.classList.remove('show');
+            setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 280);
+        }, ms || 3000);
+    }
+
+    function splitList(v) {
+        if (!v) return [];
+        var parts = String(v).split(/[,，\\s]+/);
+        var out = [];
+        for (var i = 0; i < parts.length; i++) {
+            var p = parts[i].trim().toLowerCase();
+            if (p && out.indexOf(p) < 0) out.push(p);
         }
+        return out;
+    }
 
-
-        function decodeNodeNameSafe(text) {
-            if (!text) return text;
-
-            return text.split('\\n').map(line => {
-                let hashIndex = line.lastIndexOf('#');
-
-                if (hashIndex !== -1 && line.includes('://')) {
-                    let beforeHash = line.substring(0, hashIndex);
-                    let afterHash = line.substring(hashIndex + 1);
-
-                    try {
-                        return beforeHash + '#' + decodeURIComponent(afterHash);
-                    } catch (e) {
-                        return line;
-                    }
-                }
-
-                return line;
-            }).join('\\n');
+    function tryRegex(pattern, flags, label) {
+        if (!pattern) return;
+        try {
+            new RegExp(pattern, flags);
+        } catch (e) {
+            throw new Error((label || '') + ' 正则表达式无效：' + e.message);
         }
+    }
 
+    /* ======================= 双时钟（CN = UTC+8 / UTC） ======================= */
+    function clockText(offsetSeconds) {
+        var d = new Date(Date.now() + offsetSeconds * 1000);
+        return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate()) +
+            ' ' + pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes()) + ':' + pad2(d.getUTCSeconds());
+    }
+    function tickClock() {
+        var cn = $('clockCN');
+        var utc = $('clockUTC');
+        if (cn) cn.textContent = clockText(8 * 3600);
+        if (utc) utc.textContent = clockText(0);
+    }
+    tickClock();
+    setInterval(tickClock, 1000);
 
-        window.onload = () => {
-            ${subItems.map(item => `
-                if(document.getElementById('qr_my_${item.name}')) new QRCode(document.getElementById('qr_my_${item.name}'), {
-                    text: '${url.origin}${item.path}',
-                    width: 85,
-                    height: 85,
-                    colorDark: "#000",
-                    colorLight: "#fff",
-                    correctLevel: QRCode.CorrectLevel.L
-                });
+    /* ======================= 全局状态 ======================= */
+    var App = {
+        version: BOOT.version || 0,
+        baseline: clone(BOOT.config || {}),
+        favorites: normFav((BOOT.config || {}).favorites),
+        specific: clone(((BOOT.config || {}).rules || {}).specificRules || {}),
+        merged: [],
+        sources: [],
+        stats: null,
+        seed: BOOT.seed || '',
+        loaded: false,
+        fetching: false,
+        queueFetch: false,
+        globalBusy: false,
+        lastOp: '尚未执行任何操作',
+        appliedKeyword: ((BOOT.config || {}).preview || {}).keyword || '',
+        visibleCount: 0,
+        limitInfo: null,
+        savedLabel: ''
+    };
 
-                if(document.getElementById('qr_guest_${item.name}')) new QRCode(document.getElementById('qr_guest_${item.name}'), {
-                    text: '${url.origin}/sub?token=${guest}${item.path.split('?')[1] ? '&' + item.path.split('?')[1] : ''}',
-                    width: 85,
-                    height: 85,
-                    colorDark: "#000",
-                    colorLight: "#fff",
-                    correctLevel: QRCode.CorrectLevel.L
-                });
-            `).join('\n')}
+    function normFav(arr) {
+        var out = [];
+        if (!Array.isArray(arr)) return out;
+        for (var i = 0; i < arr.length; i++) {
+            var it = arr[i];
+            var id = '';
+            var name = '';
+            if (typeof it === 'string') {
+                id = it;
+            } else if (it && typeof it === 'object') {
+                id = it.id || it.fingerprint || '';
+                name = it.name || '';
+            }
+            id = String(id || '').trim();
+            if (!id) continue;
+            var dup = false;
+            for (var j = 0; j < out.length; j++) { if (out[j].id === id) { dup = true; break; } }
+            if (!dup) out.push({ id: id, name: String(name) });
+        }
+        return out;
+    }
 
-            ['content', 'customNodes'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el && el.value) el.value = decodeNodeNameSafe(el.value);
-            });
+    /* ======================= 模块定义 ======================= */
+    var MODS = {};
+    function defMod(key, collect, apply) {
+        MODS[key] = {
+            key: key, collect: collect, apply: apply,
+            history: [], hIndex: -1,
+            saved: null, savedTime: '', pending: false, error: ''
         };
+    }
 
+    function collectLinks() { return { links: valOf('ta_links') }; }
+    function applyLinks(s) { if (s) setVal('ta_links', s.links); }
 
-        function copyTo(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                showToast('订阅链接已复制！');
-            });
+    function collectCustom() { return { customNodes: valOf('ta_customNodes') }; }
+    function applyCustom(s) { if (s) setVal('ta_customNodes', s.customNodes); }
+
+    function collectRules() {
+        return {
+            autoEmoji: checkedOf('chk_autoEmoji'),
+            deepDeduplicate: checkedOf('chk_deepDeduplicate'),
+            sortNodes: checkedOf('chk_sortNodes'),
+            dropInvalidNodes: checkedOf('chk_dropInvalidNodes'),
+            retainProtocols: splitList(valOf('in_retainProtocols')),
+            dropProtocols: splitList(valOf('in_dropProtocols')),
+            replaceTarget: valOf('in_replaceTarget'),
+            replaceWith: valOf('in_replaceWith'),
+            retainNameRegex: valOf('in_retainNameRegex'),
+            dropNameRegex: valOf('in_dropNameRegex'),
+            globalRename: valOf('in_globalRename'),
+            addPrefix: valOf('in_addPrefix'),
+            addSuffix: valOf('in_addSuffix'),
+            specificRules: clone(App.specific)
+        };
+    }
+
+    function applyRules(s) {
+        if (!s) return;
+        setChk('chk_autoEmoji', s.autoEmoji);
+        setChk('chk_deepDeduplicate', s.deepDeduplicate);
+        setChk('chk_sortNodes', s.sortNodes);
+        setChk('chk_dropInvalidNodes', s.dropInvalidNodes);
+        setVal('in_retainProtocols', (s.retainProtocols || []).join(','));
+        setVal('in_dropProtocols', (s.dropProtocols || []).join(','));
+        setVal('in_replaceTarget', s.replaceTarget);
+        setVal('in_replaceWith', s.replaceWith);
+        setVal('in_retainNameRegex', s.retainNameRegex);
+        setVal('in_dropNameRegex', s.dropNameRegex);
+        setVal('in_globalRename', s.globalRename);
+        setVal('in_addPrefix', s.addPrefix);
+        setVal('in_addSuffix', s.addSuffix);
+        App.specific = clone(s.specificRules || {});
+    }
+
+    function collectPreview() {
+        return {
+            limitEnabled: checkedOf('chk_limitEnabled'),
+            limit: valOf('in_limit'),
+            keyword: App.appliedKeyword || '',
+            onlyFav: checkedOf('chk_onlyFav')
+        };
+    }
+
+    function applyPreview(s) {
+        if (!s) return;
+        setChk('chk_limitEnabled', s.limitEnabled);
+        setVal('in_limit', s.limit);
+        setChk('chk_onlyFav', s.onlyFav);
+        App.appliedKeyword = s.keyword || '';
+        setVal('in_keyword', s.keyword || '');
+        if (s.keyword) {
+            $('limitHint').textContent = '当前处于查找筛选状态：仅显示匹配「' + s.keyword + '」的节点，不影响最终输出。';
         }
+    }
 
+    defMod('links', collectLinks, applyLinks);
+    defMod('rules', collectRules, applyRules);
+    defMod('preview', collectPreview, applyPreview);
+    defMod('custom', collectCustom, applyCustom);
 
-        function getPayload() {
-            let content = document.getElementById('content')
-                ? document.getElementById('content').value.replace(/：/g, ':')
-                : '';
+    /* ======================= 基准状态（上次全局保存） ======================= */
+    function normRules(r) {
+        r = r || {};
+        return {
+            autoEmoji: r.autoEmoji !== false,
+            deepDeduplicate: r.deepDeduplicate !== false,
+            sortNodes: r.sortNodes !== false,
+            dropInvalidNodes: r.dropInvalidNodes !== false,
+            retainProtocols: splitList((r.retainProtocols || []).join(',')),
+            dropProtocols: splitList((r.dropProtocols || []).join(',')),
+            replaceTarget: r.replaceTarget || '',
+            replaceWith: r.replaceWith || '',
+            retainNameRegex: r.retainNameRegex || '',
+            dropNameRegex: r.dropNameRegex || '',
+            globalRename: r.globalRename || '',
+            addPrefix: r.addPrefix || '',
+            addSuffix: r.addSuffix || '',
+            specificRules: r.specificRules || {}
+        };
+    }
 
-            let customNodes = document.getElementById('customNodes')
-                ? document.getElementById('customNodes').value.replace(/：/g, ':')
-                : '';
-
+    function baselineSlice(key) {
+        var b = App.baseline || {};
+        if (key === 'links') return { links: b.links || '' };
+        if (key === 'custom') return { customNodes: b.customNodes || '' };
+        if (key === 'rules') return normRules(b.rules);
+        if (key === 'preview') {
+            var o = b.output || {};
+            var p = b.preview || {};
             return {
-                links: decodeNodeNameSafe(content),
-                customNodes: decodeNodeNameSafe(customNodes),
-                config: {
-                    autoEmoji: document.getElementById('cfg_autoEmoji')
-                        ? document.getElementById('cfg_autoEmoji').checked
-                        : true,
-
-                    deepDeduplicate: document.getElementById('cfg_deepDeduplicate')
-                        ? document.getElementById('cfg_deepDeduplicate').checked
-                        : true,
-
-                    sortNodes: document.getElementById('cfg_sortNodes')
-                        ? document.getElementById('cfg_sortNodes').checked
-                        : true,
-
-                    dropInvalidNodes: document.getElementById('cfg_dropInvalidNodes')
-                        ? document.getElementById('cfg_dropInvalidNodes').checked
-                        : true,
-
-                    globalRename: document.getElementById('cfg_globalRename')
-                        ? document.getElementById('cfg_globalRename').value
-                        : '',
-
-                    addPrefix: document.getElementById('cfg_addPrefix')
-                        ? document.getElementById('cfg_addPrefix').value
-                        : '',
-
-                    addSuffix: document.getElementById('cfg_addSuffix')
-                        ? document.getElementById('cfg_addSuffix').value
-                        : '',
-
-                    retainNameRegex: document.getElementById('cfg_retainNameRegex')
-                        ? document.getElementById('cfg_retainNameRegex').value
-                        : '',
-
-                    dropNameRegex: document.getElementById('cfg_dropNameRegex')
-                        ? document.getElementById('cfg_dropNameRegex').value
-                        : '',
-
-                    replaceTarget: document.getElementById('cfg_replaceTarget')
-                        ? document.getElementById('cfg_replaceTarget').value
-                        : '',
-
-                    replaceWith: document.getElementById('cfg_replaceWith')
-                        ? document.getElementById('cfg_replaceWith').value
-                        : '',
-
-                    specificRules: window.CURRENT_SPECIFIC_RULES
-                }
+                limitEnabled: !!o.limitEnabled,
+                limit: (o.limitEnabled && o.limit) ? String(o.limit) : '',
+                keyword: p.keyword || '',
+                onlyFav: !!p.onlyFav
             };
         }
+        return {};
+    }
 
+    /* ======================= 历史记录（每模块独立，最多 10 步） ======================= */
+    function hPush(key) {
+        var m = MODS[key];
+        if (!m) return;
+        var cur = m.collect();
+        if (m.hIndex >= 0 && sameJSON(m.history[m.hIndex], cur)) { refreshMod(key); return; }
+        m.history = m.history.slice(0, m.hIndex + 1);   // 新修改清除重做分支
+        m.history.push(clone(cur));
+        while (m.history.length > 11) m.history.shift(); // 11 个状态 = 最多回退 10 步
+        m.hIndex = m.history.length - 1;
+        refreshMod(key);
+    }
 
-        // ================= 前端核心：请求真实预览 =================
-        const previewBtn = document.getElementById('previewBtn');
+    function hReset(key, state) {
+        var m = MODS[key];
+        if (!m) return;
+        m.history = [clone(state === undefined ? m.collect() : state)];
+        m.hIndex = 0;
+    }
 
-        if (previewBtn) {
-            previewBtn.onclick = async () => {
-                previewBtn.innerHTML = '⏳ 拉取与解析中...';
-                previewBtn.disabled = true;
+    function hUndo(key) {
+        var m = MODS[key];
+        if (!m || m.hIndex <= 0) return;
+        m.hIndex--;
+        m.apply(clone(m.history[m.hIndex]));
+        afterStateChange(key);
+        toast('已撤销（' + (m.hIndex) + '/10）');
+    }
 
-                try {
-                    const payload = getPayload();
-                    const targetKw = payload.config.replaceTarget;
+    function hRedo(key) {
+        var m = MODS[key];
+        if (!m || m.hIndex >= m.history.length - 1) return;
+        m.hIndex++;
+        m.apply(clone(m.history[m.hIndex]));
+        afterStateChange(key);
+        toast('已重做（' + (m.hIndex) + '/10）');
+    }
 
-                    const res = await fetch('/preview', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
+    function afterStateChange(key) {
+        refreshAll();
+        if (key === 'preview') {
+            applySelectionLocal();
+            renderNodes();
+            renderStats();
+            renderOpBar();
+        } else {
+            fetchPreview('撤销/重做');
+        }
+    }
 
-                    if (!res.ok) {
-                        throw new Error(await res.text());
-                    }
+    /* ======================= 状态渲染 ======================= */
+    function refreshMod(key) {
+        var m = MODS[key];
+        if (!m) return;
+        var cur = JSON.stringify(m.collect());
+        var savedJson = m.saved ? JSON.stringify(m.saved) : '';
+        var baseJson = JSON.stringify(baselineSlice(key));
 
-                    const resJson = await res.json();
-
-                    if (resJson.error) {
-                        throw new Error(resJson.error);
-                    }
-
-                    let htmlContent = '<ul class="space-y-3">';
-
-                    // 极致的高亮算法 (删除线红色 vs 发光紫色)
-                    const highlight = (text, keyword, isDeleteMode = false) => {
-                        if (!keyword || !text) return text;
-
-                        try {
-                            const className = isDeleteMode
-                                ? "bg-red-500/50 text-white px-0.5 mx-0.5 rounded line-through"
-                                : "bg-[var(--neon-purple)] text-white px-1 py-0.5 mx-0.5 rounded shadow-[0_0_8px_var(--neon-purple)]";
-
-                            return text.replace(
-                                new RegExp(\`(\${keyword})\`, 'gi'),
-                                \`<mark class="\${className}">$1</mark>\`
-                            );
-                        } catch (e) {
-                            return text;
-                        }
-                    };
-
-                    const renderList = (nodesArr, isCustom) => {
-                        nodesArr.forEach((node, index) => {
-                            if (!node.valid) return;
-
-                            let origDisplay = highlight(node.originalName, targetKw, true);
-                            let finalDisplay = highlight(node.name, payload.config.replaceWith, false);
-
-                            let diffHtml = '';
-
-                            if (node.originalName !== node.name && !isCustom) {
-                                diffHtml = \`<div class="text-[11px] text-gray-500 line-through mb-1 flex items-center gap-2">
-                                    <svg class="w-3 h-3 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-                                    </svg>
-                                    \${origDisplay}
-                                </div>\`;
-                            }
-
-                            let hasRule = window.CURRENT_SPECIFIC_RULES[node.identifier];
-
-                            let borderClass = hasRule
-                                ? 'border-[var(--neon-purple)]/60 bg-[var(--neon-purple)]/10'
-                                : 'border-white/10 hover:border-white/30 bg-black/50';
-
-                            htmlContent += \`
-                                <li class="p-3 rounded-xl border \${borderClass} transition-all duration-300 flex items-start gap-3 relative overflow-hidden group">
-                                    \${!isCustom ? \`<input type="checkbox" class="node-checkbox form-checkbox h-4 w-4 mt-1.5 text-[var(--neon-cyan)] rounded border-gray-600 bg-black cursor-pointer" value="\${node.identifier}">\` : '<span class="w-4"></span>'}
-
-                                    <div class="flex-1 min-w-0">
-                                        <div class="flex items-center gap-2 mb-1.5">
-                                            <span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-700/80 text-gray-300 border border-gray-600 uppercase tracking-wider">
-                                                \${node.protocol}
-                                            </span>
-
-                                            \${isCustom ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-pink-500/20 text-pink-400 border border-pink-500/30">自定义输出</span>' : ''}
-
-                                            \${hasRule ? '<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-500/20 text-[var(--neon-purple)] border border-[var(--neon-purple)]/50">存在专属附加规则</span>' : ''}
-                                        </div>
-
-                                        \${diffHtml}
-
-                                        <div class="text-[13px] font-bold text-[var(--neon-cyan)] truncate w-full" title="\${node.name}">
-                                            \${finalDisplay}
-                                        </div>
-
-                                        <div class="text-[9px] text-gray-500 truncate w-full mt-1.5 border-t border-white/5 pt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            \${node.raw}
-                                        </div>
-                                    </div>
-                                </li>
-                            \`;
-                        });
-                    };
-
-                    if (resJson.nodes && resJson.nodes.length > 0) {
-                        renderList(resJson.nodes, false);
-                    } else {
-                        htmlContent += '<li class="text-gray-500 p-4 text-center">暂无符合条件的节点（有可能全部被你的剔除规则排除了）</li>';
-                    }
-
-                    if (resJson.customNodes && resJson.customNodes.length > 0) {
-                        renderList(resJson.customNodes, true);
-                    }
-
-                    htmlContent += '</ul>';
-
-                    document.getElementById('previewContent').innerHTML = htmlContent;
-
-                    // 绑定选中框事件
-                    document.querySelectorAll('.node-checkbox').forEach(cb => {
-                        cb.addEventListener('change', () => {
-                            document.getElementById('selectedCount').innerText =
-                                document.querySelectorAll('.node-checkbox:checked').length;
-                        });
-                    });
-
-                    document.getElementById('selectedCount').innerText = '0';
-
-                    document.getElementById('previewSection').classList.remove('hidden');
-                    document.getElementById('previewSection').classList.add('flex');
-
-                    document.getElementById('previewSection').scrollIntoView({
-                        behavior: 'smooth',
-                        block: 'start'
-                    });
-
-                } catch (e) {
-                    showToast('预览失败: ' + e.message, 'error');
-                } finally {
-                    previewBtn.innerHTML = '⚡ 应用配置并预览';
-                    previewBtn.disabled = false;
-                }
-            };
+        var st = $('st-' + key);
+        if (st) {
+            var text = '未修改';
+            var tone = 'ok';
+            if (m.pending) { text = '正在提交...'; tone = 'busy'; }
+            else if (m.error) { text = m.error; tone = 'error'; }
+            else if (savedJson && cur !== savedJson) { text = '有未暂存修改'; tone = 'warn'; }
+            else if (savedJson && savedJson !== baseJson) { text = '已暂存，待全局保存'; tone = 'info'; }
+            else if (m.savedTime) { text = '已保存 ' + m.savedTime; tone = 'ok'; }
+            st.textContent = text;
+            st.className = 'mod-status ' + tone;
         }
 
+        var undoBtn = document.querySelector('[data-act="undo"][data-mod="' + key + '"]');
+        var redoBtn = document.querySelector('[data-act="redo"][data-mod="' + key + '"]');
+        if (undoBtn) undoBtn.disabled = m.hIndex <= 0;
+        if (redoBtn) redoBtn.disabled = m.hIndex >= m.history.length - 1;
+    }
 
-        // ================= 前端核心：专有规则附加 =================
-        const applyBatchBtn = document.getElementById('applyBatchBtn');
+    function refreshGlobal() {
+        var el = $('globalStatus');
+        if (!el) return;
+        if (App.globalBusy) { el.textContent = '正在提交全部配置...'; el.className = 'gstatus busy'; return; }
+        if (App.globalError) { el.textContent = App.globalError; el.className = 'gstatus error'; return; }
 
-        if (applyBatchBtn) {
-            applyBatchBtn.onclick = () => {
-                const checked = document.querySelectorAll('.node-checkbox:checked');
+        var dirty = 0, staged = 0;
+        for (var i = 0; i < MOD_KEYS.length; i++) {
+            var k = MOD_KEYS[i];
+            var m = MODS[k];
+            var cur = JSON.stringify(m.collect());
+            var savedJson = m.saved ? JSON.stringify(m.saved) : '';
+            if (savedJson && cur !== savedJson) dirty++;
+            else if (savedJson && savedJson !== JSON.stringify(baselineSlice(k))) staged++;
+        }
+        var favChanged = !sameJSON(App.favorites, normFav(App.baseline.favorites));
 
-                if (checked.length === 0) {
-                    showToast('请先在下方列表中勾选你需要应用规则的节点！', 'error');
-                    return;
-                }
+        if (dirty) { el.textContent = dirty + ' 个模块有未暂存修改'; el.className = 'gstatus warn'; }
+        else if (staged) { el.textContent = staged + ' 个模块待全局保存'; el.className = 'gstatus warn'; }
+        else if (favChanged) { el.textContent = '收藏列表有未保存修改'; el.className = 'gstatus warn'; }
+        else { el.textContent = App.savedLabel || '全部已保存'; el.className = 'gstatus ok'; }
+    }
 
-                const p = document.getElementById('batchPrefix').value;
-                const s = document.getElementById('batchSuffix').value;
+    function refreshAll() {
+        for (var i = 0; i < MOD_KEYS.length; i++) refreshMod(MOD_KEYS[i]);
+        refreshGlobal();
+    }
 
-                if (!p && !s) {
-                    showToast('前缀或后缀请至少填写一项！', 'error');
-                    return;
-                }
-
-                checked.forEach(cb => {
-                    const id = cb.value;
-
-                    if (!window.CURRENT_SPECIFIC_RULES[id]) {
-                        window.CURRENT_SPECIFIC_RULES[id] = {};
+    /* ======================= 网络 ======================= */
+    function postJSON(url, payload, timeoutMs) {
+        return new Promise(function (resolve, reject) {
+            var ctrl = new AbortController();
+            var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs || 30000);
+            fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                credentials: 'same-origin',
+                signal: ctrl.signal
+            }).then(function (res) {
+                clearTimeout(timer);
+                return res.text().then(function (txt) {
+                    var data;
+                    try {
+                        data = txt ? JSON.parse(txt) : {};
+                    } catch (e) {
+                        data = { ok: res.ok, error: txt || ('HTTP ' + res.status) };
                     }
-
-                    if (p) window.CURRENT_SPECIFIC_RULES[id].prefix = p;
-                    if (s) window.CURRENT_SPECIFIC_RULES[id].suffix = s;
+                    if (!res.ok && !data.error) data.error = 'HTTP ' + res.status;
+                    if (!res.ok) data.ok = false;
+                    resolve(data);
                 });
-
-                showToast(\`成功！已为 \${checked.length} 个节点赋予了独立前后缀。\`);
-
-                document.getElementById('batchPrefix').value = '';
-                document.getElementById('batchSuffix').value = '';
-
-                // 自动再次触发预览
-                if (document.getElementById('previewBtn')) {
-                    document.getElementById('previewBtn').click();
-                }
-            };
-        }
-
-
-        const clearBatchBtn = document.getElementById('clearBatchBtn');
-
-        if (clearBatchBtn) {
-            clearBatchBtn.onclick = () => {
-                window.CURRENT_SPECIFIC_RULES = {};
-                showToast('已清空所有专属前后缀规则！');
-
-                if (document.getElementById('previewBtn')) {
-                    document.getElementById('previewBtn').click();
-                }
-            };
-        }
-
-
-        // 全局唯一保存机制
-        const btn = document.getElementById('saveBtn');
-
-        if (btn) {
-            const setUnsavedStatus = () => {
-                document.getElementById('saveStatus').innerHTML =
-                    '<span class="text-yellow-400 drop-shadow-[0_0_5px_rgba(250,204,21,0.5)]">⚠️ 尚未保存生效</span>';
-            };
-
-            const saveAction = async () => {
-                btn.innerHTML = '⏳ 写入底层 KV 中...';
-                btn.disabled = true;
-                btn.style.filter = "brightness(0.7)";
-
-                try {
-                    const payload = getPayload();
-
-                    document.getElementById('content').value = payload.links;
-                    document.getElementById('customNodes').value = payload.customNodes;
-
-                    const res = await fetch('/admin', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-
-                    if (res.ok) {
-                        document.getElementById('saveStatus').innerHTML =
-                            '<span class="text-[var(--neon-cyan)]">✓ 保存于 ' +
-                            new Date().toLocaleTimeString() +
-                            '</span>';
-
-                        showToast('配置数据已安全存入底层 KV！已对外部订阅链接完全生效。');
-                    } else {
-                        showToast('保存失败，请检查网络', 'error');
-                    }
-
-                } catch (e) {
-                    showToast('网络异常', 'error');
-                } finally {
-                    btn.innerHTML = '<svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> 保存配置(最终生效>';
-                    btn.disabled = false;
-                    btn.style.filter = "brightness(1)";
-                }
-            };
-
-            btn.onclick = saveAction;
-
-            document.querySelectorAll('input, textarea').forEach(el => {
-                el.addEventListener('input', setUnsavedStatus);
+            }).catch(function (e) {
+                clearTimeout(timer);
+                reject(new Error(e && e.name === 'AbortError' ? '请求超时' : (e.message || '网络异常')));
             });
+        });
+    }
+
+    function buildPayload() {
+        var pv = collectPreview();
+        var n = parseInt(pv.limit, 10);
+        return {
+            version: App.version,
+            links: valOf('ta_links'),
+            customNodes: valOf('ta_customNodes'),
+            rules: collectRules(),
+            favorites: clone(App.favorites),
+            output: {
+                limitEnabled: !!pv.limitEnabled,
+                limit: (isFinite(n) && n > 0) ? n : 0
+            },
+            preview: { keyword: pv.keyword || '', onlyFav: !!pv.onlyFav }
+        };
+    }
+
+    /* ======================= 数量限制（前端复算，与服务端同一算法） ======================= */
+    function hashSeed(str) {
+        var h = 2166136261 >>> 0;
+        var s = String(str || '');
+        for (var i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 16777619) >>> 0;
+        }
+        return h >>> 0;
+    }
+
+    function mulberry32(a) {
+        return function () {
+            a |= 0;
+            a = (a + 0x6D2B79F5) | 0;
+            var t = Math.imul(a ^ (a >>> 15), 1 | a);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+
+    function seededShuffle(arr, seed) {
+        var out = arr.slice();
+        var rnd = mulberry32(hashSeed(seed));
+        for (var i = out.length - 1; i > 0; i--) {
+            var j = Math.floor(rnd() * (i + 1));
+            var tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+        }
+        return out;
+    }
+
+    function applySelectionLocal() {
+        var pv = collectPreview();
+        var enabled = !!pv.limitEnabled;
+        var limit = parseInt(pv.limit, 10);
+
+        var favCount = 0, infoCount = 0, normalIdx = [];
+        for (var i = 0; i < App.merged.length; i++) {
+            var n = App.merged[i];
+            if (n.isInfoNode) { n.selected = true; infoCount++; continue; }
+            if (n.favorite) { n.selected = true; favCount++; continue; }
+            n.selected = false;
+            normalIdx.push(i);
         }
 
+        var exceeded = false;
+        if (!enabled || !isFinite(limit) || limit < 1) {
+            for (var a = 0; a < normalIdx.length; a++) App.merged[normalIdx[a]].selected = true;
+        } else if (favCount >= limit) {
+            exceeded = favCount > limit;
+        } else {
+            var remain = limit - favCount;
+            var picked = seededShuffle(normalIdx, App.seed).slice(0, remain);
+            for (var b = 0; b < picked.length; b++) App.merged[picked[b]].selected = true;
+        }
 
-        function toggleNotice() {
-            const el = document.getElementById('noticeContent');
-            const btn = document.getElementById('noticeToggle');
+        var outCount = 0;
+        for (var c = 0; c < App.merged.length; c++) if (App.merged[c].selected) outCount++;
 
-            if (el.classList.contains('hidden')) {
-                el.classList.remove('hidden');
-                btn.textContent = '收起 ▲';
+        App.limitInfo = {
+            enabled: enabled && isFinite(limit) && limit >= 1,
+            limit: isFinite(limit) ? limit : 0,
+            available: favCount + normalIdx.length,
+            favorites: favCount,
+            info: infoCount,
+            output: outCount,
+            exceeded: exceeded
+        };
+    }
+
+    /* ======================= 渲染：抓取源上报 ======================= */
+    function renderSources() {
+        var box = $('srcReport');
+        if (!box) return;
+        var s = App.sources || [];
+        var html = [];
+
+        if (App.plainCount) {
+            html.push('<div class="src-item good">');
+            html.push('<span class="src-tag">明文</span>');
+            html.push('<span>直接填写的明文节点 ' + App.plainCount + ' 行</span>');
+            html.push('</div>');
+        }
+
+        for (var i = 0; i < s.length; i++) {
+            var it = s[i];
+            html.push('<div class="src-item ' + (it.ok ? 'good' : 'bad') + '">');
+            html.push('<span class="src-tag">' + (it.ok ? 'OK' : 'FAIL') + '</span>');
+            html.push('<span>' + esc(it.host || it.url) + ' · ' +
+                (it.ok ? ('解析 ' + it.nodes + ' 个节点') : esc(it.error || '抓取失败')) + '</span>');
+            html.push('</div>');
+        }
+
+        box.innerHTML = html.join('');
+    }
+
+    /* ======================= 渲染：节点列表 ======================= */
+    function renderNodes() {
+        var list = $('nodeList');
+        if (!list) return;
+
+        if (!App.loaded) {
+            list.innerHTML = '<li class="empty">还没有预览数据，请先在「节点抓取源」点击「抓取并预览」</li>';
+            App.visibleCount = 0;
+            return;
+        }
+
+        var pv = collectPreview();
+        var kw = (pv.keyword || '').trim().toLowerCase();
+        var onlyFav = !!pv.onlyFav;
+        var rows = [];
+
+        for (var i = 0; i < App.merged.length; i++) {
+            var n = App.merged[i];
+            var hit = true;
+            if (kw) {
+                var nm = (n.name || '').toLowerCase();
+                var on = (n.originalName || '').toLowerCase();
+                hit = nm.indexOf(kw) >= 0 || on.indexOf(kw) >= 0;
+            }
+            if (onlyFav && !n.favorite) hit = false;
+            if (hit) rows.push(i);
+        }
+
+        App.visibleCount = rows.length;
+
+        if (!rows.length) {
+            list.innerHTML = '<li class="empty">没有符合条件的节点（可能是查找条件过严，或全部被规则剔除）</li>';
+            return;
+        }
+
+        var MAXR = 800;
+        var shown = rows.slice(0, MAXR);
+        var html = [];
+
+        for (var r = 0; r < shown.length; r++) {
+            var idx = shown[r];
+            var node = App.merged[idx];
+            var cls = 'node' + (node.favorite ? ' is-fav' : '') + (node.selected ? '' : ' is-off');
+
+            html.push('<li class="' + cls + '">');
+            html.push('<button class="star' + (node.favorite ? ' on' : '') + '" data-act="fav" data-i="' + idx + '" title="收藏 / 取消收藏">' +
+                (node.favorite ? '★' : '☆') + '</button>');
+            html.push('<input type="checkbox" class="pick" data-i="' + idx + '"' +
+                (App.specific[node.identifier] ? ' checked' : '') + ' title="勾选后应用专属前后缀">');
+            html.push('<div class="node-main"><div class="node-tags">');
+            html.push('<span class="badge">' + esc(node.protocol || '?') + '</span>');
+            if (node.isCustom) html.push('<span class="badge custom">自定义</span>');
+            if (node.isInfoNode) html.push('<span class="badge info">信息</span>');
+            if (node.favorite) html.push('<span class="badge fav">已收藏</span>');
+            if (!node.selected) html.push('<span class="badge off">限制外</span>');
+            html.push('</div>');
+
+            if (node.originalName && node.originalName !== node.name) {
+                html.push('<div class="node-old">' + esc(node.originalName) + '</div>');
+            }
+            html.push('<div class="node-name">' + esc(node.name) + '</div>');
+            html.push('<div class="node-raw">' + esc(node.raw) + '</div>');
+            html.push('</div></li>');
+        }
+
+        list.innerHTML = html.join('');
+        updateSelCount();
+
+        if (rows.length > MAXR) {
+            toast('节点较多，列表仅渲染前 ' + MAXR + ' 个，全部节点仍参与最终输出', 'warn', 4000);
+        }
+    }
+
+    function updateSelCount() {
+        var picks = document.querySelectorAll('#nodeList .pick:checked');
+        var box = $('selCount');
+        if (box) box.textContent = '已选 ' + picks.length + ' 项';
+    }
+
+    /* ======================= 渲染：统计与操作条 ======================= */
+    function renderStats() {
+        var box = $('statsBox');
+        if (!box) return;
+        var li = App.limitInfo || {};
+        var st = App.stats || {};
+
+        var data = [
+            { k: '节点总数', v: App.merged.length, w: false },
+            { k: '当前显示', v: App.visibleCount || 0, w: false },
+            { k: '预计输出', v: li.output || 0, w: false },
+            { k: '收藏节点', v: li.favorites || 0, w: false },
+            { k: '可用节点', v: li.available || 0, w: false },
+            { k: '自定义节点', v: App.customCount || 0, w: false }
+        ];
+
+        if (li.exceeded) data[2].w = true;
+
+        var html = [];
+        for (var i = 0; i < data.length; i++) {
+            html.push('<div class="stat' + (data[i].w ? ' warn' : '') + '"><b>' + data[i].v + '</b><span>' + data[i].k + '</span></div>');
+        }
+        box.innerHTML = html.join('');
+    }
+
+    function renderOpBar() {
+        var bar = $('opBar');
+        if (!bar) return;
+        var li = App.limitInfo || {};
+        var pv = collectPreview();
+        var parts = ['最近操作：' + App.lastOp];
+
+        if (pv.keyword) parts.push('查找筛选：' + pv.keyword + '（仅影响显示）');
+        if (pv.onlyFav) parts.push('仅显示已收藏');
+        if (li.enabled) parts.push('数量限制 ' + li.limit + '，实际输出 ' + li.output);
+        if (li.info) parts.push('含 ' + li.info + ' 个信息节点（始终保留）');
+        if (li.exceeded) parts.push('⚠ 收藏数量已超过设定上限，已保留全部收藏节点');
+
+        bar.innerHTML = '<span>' + esc(parts.join('　|　')) + '</span>';
+    }
+
+    /* ======================= 预览请求 ======================= */
+    function fetchPreview(reason, onDone) {
+        if (!BOOT.hasKV) { toast('未绑定 KV，无法抓取', 'error'); return; }
+        if (App.fetching) { App.queueFetch = true; return; }
+
+        App.fetching = true;
+        var btn = $('btnFetch');
+        if (btn) { btn.disabled = true; btn.textContent = '抓取中...'; }
+
+        var payload = buildPayload();
+        delete payload.version;
+
+        postJSON('/preview', payload, 60000).then(function (res) {
+            if (!res || !res.ok) throw new Error((res && res.error) || '预览失败');
+
+            App.merged = (res.nodes || []).concat(res.customNodes || []);
+            App.baseCount = (res.nodes || []).length;
+            App.customCount = (res.customNodes || []).length;
+            App.sources = res.sources || [];
+            App.plainCount = res.plainCount || 0;
+            App.stats = res.stats || null;
+            if (res.seed) App.seed = res.seed;
+            App.loaded = true;
+
+            // 服务端算出的输出数量应与本地一致，若不一致以服务端为准
+            if (res.stats && res.stats.limit) {
+                App.limitInfo = res.stats.limit;
+            }
+
+            var st = App.stats || {};
+            var dropped = (st.droppedProtocol || 0) + (st.droppedName || 0) + (st.deduped || 0);
+            App.lastOp = (reason || '刷新预览') + ' · 共 ' + App.merged.length + ' 个节点（规则剔除 ' +
+                dropped + '，重命名 ' + (st.renamed || 0) + '）';
+
+            if (st.favoritesUnmatched && st.favoritesUnmatched.length) {
+                toast('有 ' + st.favoritesUnmatched.length + ' 个收藏节点未出现在当前抓取结果中：' +
+                    st.favoritesUnmatched.slice(0, 3).join('、'), 'warn', 6000);
+            }
+
+            applySelectionLocal();
+            renderSources();
+            renderNodes();
+            renderStats();
+            renderOpBar();
+            refreshAll();
+
+            if (typeof onDone === 'function') onDone(st);
+        }).catch(function (e) {
+            App.lastOp = '预览失败：' + e.message;
+            renderOpBar();
+            toast('预览失败：' + e.message, 'error', 5000);
+        }).then(function () {
+            App.fetching = false;
+            if (btn) { btn.disabled = false; btn.textContent = '抓取并预览'; }
+            if (App.queueFetch) { App.queueFetch = false; fetchPreview('排队刷新'); }
+        });
+    }
+
+    /* ======================= 收藏 ======================= */
+    function toggleFav(idx) {
+        var n = App.merged[idx];
+        if (!n) return;
+        if (!n.fingerprint) { toast('该节点缺少稳定标识，无法收藏', 'error'); return; }
+
+        var pos = -1;
+        for (var i = 0; i < App.favorites.length; i++) {
+            if (App.favorites[i].id === n.fingerprint) { pos = i; break; }
+        }
+
+        if (pos >= 0) {
+            App.favorites.splice(pos, 1);
+            n.favorite = false;
+            toast('已取消收藏：' + n.name);
+        } else {
+            App.favorites.push({ id: n.fingerprint, name: n.name });
+            n.favorite = true;
+            toast('已收藏：' + n.name);
+        }
+
+        applySelectionLocal();
+        renderNodes();
+        renderStats();
+        renderOpBar();
+        refreshAll();
+    }
+
+    /* ======================= 模块级操作 ======================= */
+    function saveMod(key) {
+        var m = MODS[key];
+        if (!m) return;
+        try {
+            var snap = m.collect();
+            if (key === 'rules') {
+                tryRegex(snap.retainNameRegex, 'i', '正则保留');
+                tryRegex(snap.dropNameRegex, 'i', '正则剔除');
+                tryRegex(snap.replaceTarget, 'gi', '查找关键字');
+            }
+            if (key === 'preview' && snap.limitEnabled) {
+                var n = parseInt(snap.limit, 10);
+                if (!String(snap.limit).trim() || !isFinite(n) || n < 1) {
+                    throw new Error('节点数量必须是大于 0 的整数');
+                }
+            }
+            m.saved = clone(snap);
+            m.savedTime = nowTime();
+            m.error = '';
+            hReset(key, snap);
+            refreshAll();
+            toast('本模块配置已暂存，点击「保存所有配置」后才会正式生效');
+        } catch (e) {
+            m.error = '暂存失败';
+            refreshAll();
+            toast('暂存失败：' + e.message, 'error', 4000);
+        }
+    }
+
+    function revertMod(key) {
+        var m = MODS[key];
+        if (!m) return;
+        var state = m.saved ? clone(m.saved) : clone(baselineSlice(key));
+        m.apply(state);
+        m.error = '';
+        hReset(key, state);
+        refreshAll();
+        if (key === 'preview') {
+            applySelectionLocal();
+            renderNodes();
+            renderStats();
+            renderOpBar();
+        } else {
+            fetchPreview('取消恢复');
+        }
+        toast('已恢复到本模块最近一次保存的状态');
+    }
+
+    /* ======================= 规则执行 ======================= */
+    function applyRulesAction(label, doneMsg) {
+        var r = collectRules();
+        try {
+            tryRegex(r.retainNameRegex, 'i', '正则保留');
+            tryRegex(r.dropNameRegex, 'i', '正则剔除');
+            tryRegex(r.replaceTarget, 'gi', '查找关键字');
+        } catch (e) {
+            toast(e.message, 'error', 5000);
+            App.lastOp = e.message;
+            renderOpBar();
+            return;
+        }
+
+        hPush('rules');
+        refreshAll();
+        fetchPreview(label, function (st) {
+            toast(typeof doneMsg === 'function' ? doneMsg(st) : (doneMsg || (label + '完成')));
+        });
+    }
+
+    /* ======================= 全局保存 ======================= */
+    function globalSave() {
+        if (App.globalBusy) return;
+        if (!BOOT.hasKV) { toast('未绑定 KV，无法保存', 'error'); return; }
+
+        var payload = buildPayload();
+        try {
+            tryRegex(payload.rules.retainNameRegex, 'i', '正则保留');
+            tryRegex(payload.rules.dropNameRegex, 'i', '正则剔除');
+            tryRegex(payload.rules.replaceTarget, 'gi', '查找关键字');
+            if (payload.output.limitEnabled) {
+                if (!Number.isInteger(payload.output.limit) || payload.output.limit < 1) {
+                    throw new Error('节点数量必须是大于 0 的整数');
+                }
+            }
+        } catch (e) {
+            toast(e.message, 'error', 5000);
+            return;
+        }
+
+        if (!payload.links && !payload.customNodes) {
+            if (!window.confirm('抓取源与自定义节点都为空，继续保存会导致订阅没有节点。确定继续吗？')) return;
+        }
+
+        App.globalBusy = true;
+        App.globalError = '';
+        for (var pi = 0; pi < MOD_KEYS.length; pi++) MODS[MOD_KEYS[pi]].pending = true;
+        var btn = $('btnGlobalSave');
+        if (btn) { btn.disabled = true; btn.textContent = '提交中...'; }
+        refreshAll();
+
+        postJSON('/admin', payload, 45000).then(function (res) {
+            if (!res || !res.ok) throw new Error((res && res.error) || '保存失败');
+
+            App.version = res.version || (App.version + 1);
+            App.baseline = {
+                links: payload.links,
+                customNodes: payload.customNodes,
+                rules: payload.rules,
+                output: payload.output,
+                favorites: clone(App.favorites),
+                preview: { keyword: payload.preview.keyword, onlyFav: payload.preview.onlyFav }
+            };
+
+            var t = nowTime();
+            for (var i = 0; i < MOD_KEYS.length; i++) {
+                var m = MODS[MOD_KEYS[i]];
+                m.saved = clone(m.collect());
+                m.savedTime = t;
+                m.error = '';
+                m.pending = false;
+                hReset(MOD_KEYS[i], m.saved);
+            }
+
+            App.savedLabel = '全部已保存 ' + t;
+            App.globalError = '';
+            var ver = $('verText');
+            if (ver) ver.textContent = 'v' + App.version;
+            var st = $('savedAtText');
+            if (st) st.textContent = new Date(res.savedAt || Date.now()).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+
+            refreshAll();
+            toast('全部配置已保存并正式生效', 'success', 4000);
+            if (res.warning) toast(res.warning, 'warn', 7000);
+        }).catch(function (e) {
+            App.savedLabel = '';
+            App.globalError = '保存失败：' + e.message;
+            toast('保存失败：' + e.message + '（配置未生效）', 'error', 6000);
+            refreshAll();
+        }).then(function () {
+            App.globalBusy = false;
+            for (var qi = 0; qi < MOD_KEYS.length; qi++) MODS[MOD_KEYS[qi]].pending = false;
+            if (btn) { btn.disabled = false; btn.textContent = '保存所有配置'; }
+            refreshAll();
+        });
+    }
+
+    /* ======================= 事件绑定 ======================= */
+    // 模块工具栏
+    document.addEventListener('click', function (e) {
+        var t = e.target;
+        while (t && t !== document.body && !(t.getAttribute && t.getAttribute('data-act'))) t = t.parentNode;
+        if (!t || t === document.body || !t.getAttribute) return;
+
+        var act = t.getAttribute('data-act');
+        var mod = t.getAttribute('data-mod');
+
+        if (act === 'undo') hUndo(mod);
+        else if (act === 'redo') hRedo(mod);
+        else if (act === 'revert') revertMod(mod);
+        else if (act === 'module-save') saveMod(mod);
+    });
+
+    // 折叠
+    document.addEventListener('click', function (e) {
+        var t = e.target;
+        while (t && t !== document.body && !(t.getAttribute && t.getAttribute('data-toggle'))) t = t.parentNode;
+        if (!t || t === document.body || !t.getAttribute) return;
+        var card = $(t.getAttribute('data-toggle'));
+        if (!card) return;
+        card.classList.toggle('open');
+        var arrow = t.querySelector('.collapse-arrow');
+        if (arrow) arrow.textContent = card.classList.contains('open') ? '收起 ▲' : '展开 ▼';
+    });
+
+    // 节点列表内交互
+    var nodeList = $('nodeList');
+    if (nodeList) {
+        nodeList.addEventListener('click', function (e) {
+            var t = e.target;
+            while (t && t !== this && !(t.getAttribute && t.getAttribute('data-act'))) t = t.parentNode;
+            if (!t || t === this || !t.getAttribute) return;
+            if (t.getAttribute('data-act') === 'fav') {
+                e.preventDefault();
+                toggleFav(parseInt(t.getAttribute('data-i'), 10));
+            }
+        });
+        nodeList.addEventListener('change', function (e) {
+            if (e.target && e.target.classList && e.target.classList.contains('pick')) updateSelCount();
+        });
+    }
+
+    // 订阅地址复制
+    var subcards = document.querySelectorAll('.subcard');
+    for (var si = 0; si < subcards.length; si++) {
+        subcards[si].addEventListener('click', function () {
+            var link = this.getAttribute('data-copy') || '';
+            if (!link) return;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(link).then(function () {
+                    toast('订阅链接已复制');
+                }).catch(function () { toast('复制失败，请手动选中复制', 'error'); });
             } else {
-                el.classList.add('hidden');
-                btn.textContent = '展开 ▼';
+                toast('当前浏览器不支持自动复制', 'warn');
+            }
+        });
+    }
+
+    // 历史记录防抖（连续输入不产生大量记录）
+    var histTimers = {};
+    function scheduleHistory(key) {
+        if (histTimers[key]) clearTimeout(histTimers[key]);
+        histTimers[key] = setTimeout(function () {
+            histTimers[key] = null;
+            hPush(key);
+            refreshAll();
+        }, 700);
+    }
+
+    var bodyMap = { 'body-links': 'links', 'body-rules': 'rules', 'body-preview': 'preview', 'body-custom': 'custom' };
+    Object.keys(bodyMap).forEach(function (id) {
+        var box = $(id);
+        var key = bodyMap[id];
+        if (!box) return;
+
+        box.addEventListener('input', function (e) {
+            var tid = e.target && e.target.id;
+            App.globalError = '';
+            if (key === 'preview') {
+                if (tid === 'in_keyword') { return; }   // 查找需点击按钮才生效
+                if (tid === 'in_limit' || tid === 'chk_limitEnabled') { onLimitChange(); return; }
+            }
+            scheduleHistory(key);
+            refreshGlobal();
+        });
+
+        box.addEventListener('change', function (e) {
+            var tid = e.target && e.target.id;
+            if (key === 'preview' && tid === 'chk_onlyFav') {
+                hPush('preview');
+                renderNodes();
+                renderStats();
+                renderOpBar();
+                refreshAll();
+                return;
+            }
+            scheduleHistory(key);
+            refreshGlobal();
+        });
+    });
+
+    // 数量限制变化
+    function onLimitChange() {
+        var pv = collectPreview();
+        var hint = $('limitHint');
+        if (pv.limitEnabled) {
+            var n = Number(pv.limit);
+            if (!String(pv.limit).trim() || !isFinite(n) || n < 1 || Math.floor(n) !== n) {
+                if (hint) {
+                    hint.textContent = '⚠ 节点数量必须是大于 0 的整数，当前输入不会生效';
+                    hint.style.color = '#f87171';
+                }
+                return;
             }
         }
+        if (hint) {
+            hint.textContent = '收藏节点始终优先保留，其余名额从普通节点中随机补足，随机结果按天固定。';
+            hint.style.color = '';
+        }
+        applySelectionLocal();
+        renderNodes();
+        renderStats();
+        renderOpBar();
+        scheduleHistory('preview');
+        refreshGlobal();
+    }
 
+    // 各按钮
+    var btnFetch = $('btnFetch');
+    if (btnFetch) btnFetch.onclick = function () { fetchPreview('抓取节点'); };
 
-        // 注入美化滚动条
-        const style = document.createElement('style');
+    var btnPreviewRefresh = $('btnPreviewRefresh');
+    if (btnPreviewRefresh) btnPreviewRefresh.onclick = function () { fetchPreview('手动刷新'); };
 
-        style.innerHTML = \`
-            .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-            .custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); border-radius: 4px; }
-            .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,243,255,0.3); border-radius: 4px; }
-            .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0,243,255,0.6); }
-        \`;
+    var btnCustomPreview = $('btnCustomPreview');
+    if (btnCustomPreview) {
+        btnCustomPreview.onclick = function () {
+            hPush('custom');
+            fetchPreview('更新自定义节点');
+        };
+    }
 
-        document.head.appendChild(style);
-    </script>
+    var btnSearch = $('btnSearch');
+    if (btnSearch) {
+        btnSearch.onclick = function () {
+            var kw = valOf('in_keyword').trim();
+            App.appliedKeyword = kw;
+            hPush('preview');
+            if (!App.loaded) { fetchPreview('查找'); return; }
+            renderNodes();
+            renderStats();
+            renderOpBar();
+            refreshAll();
+            if (kw) {
+                toast('查找完成：匹配 ' + App.visibleCount + ' 个节点');
+                if ($('limitHint')) {
+                    $('limitHint').textContent = '当前处于查找筛选状态：仅显示匹配「' + kw + '」的节点，不影响最终输出。';
+                }
+            } else {
+                toast('关键字为空，已显示全部节点', 'warn');
+            }
+        };
+    }
+
+    var btnClearSearch = $('btnClearSearch');
+    if (btnClearSearch) {
+        btnClearSearch.onclick = function () {
+            setVal('in_keyword', '');
+            App.appliedKeyword = '';
+            hPush('preview');
+            renderNodes();
+            renderStats();
+            renderOpBar();
+            refreshAll();
+            if ($('limitHint')) {
+                $('limitHint').textContent = '收藏节点始终优先保留，其余名额从普通节点中随机补足，随机结果按天固定。';
+                $('limitHint').style.color = '';
+            }
+            toast('已清除查找条件，恢复显示全部节点');
+        };
+    }
+
+    var btnReplace = $('btnReplace');
+    if (btnReplace) {
+        btnReplace.onclick = function () {
+            if (!valOf('in_replaceTarget')) {
+                toast('请先填写需要查找替换的内容', 'error');
+                return;
+            }
+            applyRulesAction('执行替换', function (st) {
+                var hits = st.replaceHits || 0;
+                return hits > 0
+                    ? '替换完成：' + hits + ' 个节点名称被修改'
+                    : '替换已执行，但没有节点名称命中该关键字';
+            });
+        };
+    }
+
+    var btnApplyRetain = $('btnApplyRetain');
+    if (btnApplyRetain) {
+        btnApplyRetain.onclick = function () {
+            if (!valOf('in_retainNameRegex')) { toast('请先填写正则保留表达式', 'error'); return; }
+            applyRulesAction('执行保留', function (st) {
+                return '保留规则已执行，剩余 ' + (App.merged.length) + ' 个节点';
+            });
+        };
+    }
+
+    var btnApplyDrop = $('btnApplyDrop');
+    if (btnApplyDrop) {
+        btnApplyDrop.onclick = function () {
+            if (!valOf('in_dropNameRegex')) { toast('请先填写正则剔除表达式', 'error'); return; }
+            applyRulesAction('执行剔除', function (st) {
+                return '剔除规则已执行，共剔除 ' + (st.droppedName || 0) + ' 个节点';
+            });
+        };
+    }
+
+    var btnApplyRename = $('btnApplyRename');
+    if (btnApplyRename) {
+        btnApplyRename.onclick = function () {
+            if (!valOf('in_globalRename')) { toast('请先填写重命名内容', 'error'); return; }
+            applyRulesAction('执行重命名', '重命名已执行');
+        };
+    }
+
+    var btnApplyPrefix = $('btnApplyPrefix');
+    if (btnApplyPrefix) {
+        btnApplyPrefix.onclick = function () {
+            if (!valOf('in_addPrefix')) { toast('请先填写前缀内容', 'error'); return; }
+            applyRulesAction('添加前缀', '已为全部节点添加前缀');
+        };
+    }
+
+    var btnApplySuffix = $('btnApplySuffix');
+    if (btnApplySuffix) {
+        btnApplySuffix.onclick = function () {
+            if (!valOf('in_addSuffix')) { toast('请先填写后缀内容', 'error'); return; }
+            applyRulesAction('添加后缀', '已为全部节点添加后缀');
+        };
+    }
+
+    var btnBatchApply = $('btnBatchApply');
+    if (btnBatchApply) {
+        btnBatchApply.onclick = function () {
+            var picks = document.querySelectorAll('#nodeList .pick:checked');
+            if (!picks.length) { toast('请先勾选需要应用规则的节点', 'error'); return; }
+            var p = valOf('in_batchPrefix');
+            var s = valOf('in_batchSuffix');
+            if (!p && !s) { toast('前缀或后缀请至少填写一项', 'error'); return; }
+
+            hPush('rules');
+            var count = 0;
+            for (var i = 0; i < picks.length; i++) {
+                var idx = parseInt(picks[i].getAttribute('data-i'), 10);
+                var node = App.merged[idx];
+                if (!node || !node.identifier) continue;
+                var rule = App.specific[node.identifier] || {};
+                if (p) rule.prefix = p;
+                if (s) rule.suffix = s;
+                App.specific[node.identifier] = rule;
+                count++;
+            }
+            setVal('in_batchPrefix', '');
+            setVal('in_batchSuffix', '');
+            hPush('rules');
+            toast('已为 ' + count + ' 个节点设置专属前后缀');
+            fetchPreview('应用专属前后缀');
+        };
+    }
+
+    var btnBatchClear = $('btnBatchClear');
+    if (btnBatchClear) {
+        btnBatchClear.onclick = function () {
+            hPush('rules');
+            App.specific = {};
+            hPush('rules');
+            toast('已清空全部专属前后缀规则');
+            fetchPreview('清除专属规则');
+        };
+    }
+
+    var btnGlobalSave = $('btnGlobalSave');
+    if (btnGlobalSave) btnGlobalSave.onclick = globalSave;
+
+    // 离开页面提醒（只提醒，不自动保存）
+    window.addEventListener('beforeunload', function (e) {
+        var dirty = false;
+        for (var i = 0; i < MOD_KEYS.length; i++) {
+            var m = MODS[MOD_KEYS[i]];
+            var cur = JSON.stringify(m.collect());
+            var savedJson = m.saved ? JSON.stringify(m.saved) : JSON.stringify(baselineSlice(MOD_KEYS[i]));
+            if (cur !== savedJson) { dirty = true; break; }
+        }
+        if (dirty) {
+            e.preventDefault();
+            e.returnValue = '有尚未保存的修改，确定离开吗？';
+            return e.returnValue;
+        }
+    });
+
+    /* ======================= 节点名称解码（保持原项目行为） ======================= */
+    function decodeNodeNameSafe(text) {
+        if (!text) return text;
+        return String(text).split('\\n').map(function (line) {
+            var hashIndex = line.lastIndexOf('#');
+            if (hashIndex !== -1 && line.indexOf('://') !== -1) {
+                var beforeHash = line.substring(0, hashIndex);
+                var afterHash = line.substring(hashIndex + 1);
+                try {
+                    return beforeHash + '#' + decodeURIComponent(afterHash);
+                } catch (e) {
+                    return line;
+                }
+            }
+            return line;
+        }).join('\\n');
+    }
+
+    /* ======================= 初始化 ======================= */
+    function initQR() {
+        if (typeof QRCode === 'undefined') return;
+        var cards = document.querySelectorAll('.subcard');
+        for (var i = 0; i < cards.length; i++) {
+            var box = cards[i].querySelector('.subcard-qr');
+            if (!box) continue;
+            try {
+                new QRCode(box, {
+                    text: cards[i].getAttribute('data-copy') || '',
+                    width: 78,
+                    height: 78,
+                    colorDark: '#000',
+                    colorLight: '#fff',
+                    correctLevel: QRCode.CorrectLevel.L
+                });
+            } catch (e) { }
+        }
+    }
+
+    function init() {
+        var taLinks = $('ta_links');
+        if (taLinks && taLinks.value) taLinks.value = decodeNodeNameSafe(taLinks.value);
+        var taCustom = $('ta_customNodes');
+        if (taCustom && taCustom.value) taCustom.value = decodeNodeNameSafe(taCustom.value);
+
+        initQR();
+
+        for (var i = 0; i < MOD_KEYS.length; i++) {
+            var k = MOD_KEYS[i];
+            hReset(k, MODS[k].collect());
+        }
+
+        applySelectionLocal();
+        renderStats();
+        renderOpBar();
+        refreshAll();
+
+        if (BOOT.hasKV) {
+            fetchPreview('初始加载');
+        } else {
+            App.lastOp = '未绑定 KV，无法抓取节点';
+            renderOpBar();
+        }
+    }
+
+    init();
+})();
+</script>
 </body>
 </html>`;
 }
 
 
-// 基础编解码函数
+// ================= 基础编解码与工具函数 =================
 async function ADD(envadd) {
-    var addtext = envadd
+    var addtext = String(envadd === undefined || envadd === null ? '' : envadd)
         .replace(/[  "'|\r\n]+/g, '\n')
         .replace(/\n+/g, '\n');
 
@@ -1872,10 +3481,10 @@ async function getUrl(
     // 不转发后台 Cookie / Authorization，避免管理凭据泄露给第三方订阅地址。
     const newHeaders = new Headers();
 
-    // 【修复 1】：取消透传前端的 Accept，防止目标 API 返回 JSON 数据导致后续无法解析 Base64
+    // 取消透传前端的 Accept，防止目标 API 返回 JSON 导致后续无法解析 Base64
     newHeaders.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain,application/x-envoy,*/*;q=0.8');
-    
-    // 【修复 2】：移除浏览器 UA 中的 Mozilla 标识，防止被订阅防DDoS面板识别为浏览器而返回网页
+
+    // 移除浏览器 UA 中的 Mozilla 标识，防止被订阅防 DDoS 面板识别为浏览器而返回网页
     newHeaders.set(
         'User-Agent',
         `v2rayN/6.45 cmliu/CF-Workers-SUB ${追加UA}`
@@ -1890,114 +3499,4 @@ async function getUrl(
     });
 
     return fetch(modifiedRequest);
-}
-
-
-// ====== 多订阅源并发抓取与解析 ======
-async function getSUB(api, request, 追加UA, userAgentHeader) {
-    const sources = Array.isArray(api)
-        ? [...new Set(api.filter(item =>
-            typeof item === 'string' && item.trim()
-        ))]
-        : [];
-
-    if (sources.length === 0) {
-        return [[], ''];
-    }
-
-    let newapi = '';
-    let 异常订阅 = '';
-    let 订阅转换URLs = '';
-
-    const controller = new AbortController();
-
-    // 给远程订阅留出合理响应时间，并真正把 signal 传给 fetch。
-    const timeout = setTimeout(() => controller.abort(), 12000);
-
-    try {
-        const responses = await Promise.allSettled(
-            sources.map(async apiUrl => {
-                const response = await getUrl(
-                    request,
-                    apiUrl,
-                    追加UA,
-                    userAgentHeader,
-                    controller.signal
-                );
-
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-
-                return response.text();
-            })
-        );
-
-        responses.forEach((response, index) => {
-            if (response.status !== 'fulfilled') {
-                console.warn(
-                    '订阅源抓取失败:',
-                    sources[index],
-                    response.reason?.message || response.reason
-                );
-                return;
-            }
-
-            const content = String(response.value || '')
-                .replace(/^\uFEFF/, '')
-                .trim();
-
-            if (!content) return;
-
-            const anomalyHost = new URL(sources[index]).host;
-
-            const anomalyNode =
-                'trojan://CMLiussss@127.0.0.1:8888?security=tls&allowInsecure=1&type=tcp&headerType=none#' +
-                encodeURIComponent(`异常订阅 ${anomalyHost}`) +
-                '\n';
-
-            // Clash YAML / sing-box JSON：这里只记录转换 URL，不直接解析为节点。
-            if (
-                content.includes('proxies:') ||
-                (content.includes('outbounds"') && content.includes('inbounds"'))
-            ) {
-                订阅转换URLs += '|' + sources[index];
-
-            } else if (content.includes('://')) {
-                // 明文节点
-                newapi += content + '\n';
-
-            } else {
-                // Base64 订阅
-                const compact = content.replace(/\s/g, '');
-
-                if (/^[A-Za-z0-9+/_=-]+$/.test(compact)) {
-                    try {
-                        newapi += base64Decode(compact) + '\n';
-                    } catch (error) {
-                        console.warn(
-                            '订阅 Base64 解码失败:',
-                            sources[index],
-                            error
-                        );
-
-                        异常订阅 += anomalyNode;
-                    }
-                } else {
-                    异常订阅 += anomalyNode;
-                }
-            }
-        });
-
-    } catch (error) {
-        console.error('订阅抓取异常:', error);
-
-    } finally {
-        clearTimeout(timeout);
-    }
-
-    return [
-        await ADD(newapi + 异常订阅),
-        订阅转换URLs
-    ];
 }
