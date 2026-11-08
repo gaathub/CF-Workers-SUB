@@ -36,14 +36,12 @@ function chooseOutputNodes(nodes, config) {
     const limit = Number(config?.outputLimit || 0);
     if (!Number.isInteger(limit) || limit < 0) throw new Error('节点数量限制必须是非负整数');
     const favorites = new Set(Array.isArray(config?.favorites) ? config.favorites : []);
-    const valid = nodes.filter(n=>n.valid), metadata=nodes.filter(n=>!n.valid);
-    const pinned = valid.filter(n => favorites.has(nodeStableId(n)));
-    const ordinary = valid.filter(n => !favorites.has(nodeStableId(n)));
-    if (!limit || valid.length <= limit) return nodes;
-    if (pinned.length >= limit) return [...pinned, ...metadata];
-    const pool = [...ordinary];
+    const pinned = nodes.filter(n => n.valid && favorites.has(nodeStableId(n)));
+    const ordinary = nodes.filter(n => !n.valid || !favorites.has(nodeStableId(n)));
+    if (!limit || nodes.length <= limit || pinned.length >= limit) return pinned.length >= limit && limit ? [...pinned, ...ordinary.filter(n=>!n.valid)] : nodes;
+    const pool = ordinary.filter(n => n.valid);
     for (let i=pool.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [pool[i],pool[j]]=[pool[j],pool[i]]; }
-    return [...pinned, ...pool.slice(0, Math.max(0, limit-pinned.length)), ...metadata];
+    return [...pinned, ...pool.slice(0, Math.max(0, limit-pinned.length)), ...ordinary.filter(n=>!n.valid)];
 }
 function nodeStableId(n) { return n.protocol === 'vmess' ? `${n.protocol}://${n.address}:${n.port}/${n.id}` : `${n.protocol}://${n.address}:${n.port}/${n.id || ''}`; }
 
@@ -103,25 +101,21 @@ export default {
                 const rawResolved = await resolveLinksToNodes(
                     data.links || '',
                     request,
-                    userAgentHeader,
-                    true
+                    userAgentHeader
                 );
 
                 // 2. 将抓取到的裸节点输入二次编辑引擎处理
-                const processedArray = processNodes(rawResolved.text, data.config || {});
+                const processedArray = processNodes(rawResolved, data.config || {});
 
                 // 3. 处理自定义节点（不受上方过滤规则限制）
                 const customArray = processNodes(
                     data.customNodes || '',
                     Object.assign({}, data.config, { isCustom: true })
                 );
-                const selected = chooseOutputNodes([...processedArray, ...customArray], data.config || {});
-                const selectedIds = new Set(selected.map(nodeStableId));
 
                 return new Response(JSON.stringify({
-                    customNodes: customArray.filter(n=>selectedIds.has(nodeStableId(n))).map(n => ({...n, stableId: nodeStableId(n)})),
-                    nodes: processedArray.filter(n=>selectedIds.has(nodeStableId(n))).map(n => ({...n, stableId: nodeStableId(n)})),
-                    sourceErrors: rawResolved.errors
+                    nodes: processedArray,
+                    customNodes: customArray
                 }), {
                     status: 200,
                     headers: { "Content-Type": "application/json;charset=utf-8" }
@@ -377,12 +371,11 @@ export default {
 
 
 // ================= 核心工具函数：真实拉取远程节点 =================
-async function resolveLinksToNodes(text, request, userAgentHeader, returnMeta = false) {
+async function resolveLinksToNodes(text, request, userAgentHeader) {
     let urls = await ADD(text);
     let req_data = "";
     let selfBuilt = "";
     let subLinks = "";
-    const errors = [];
 
     // 区分出自建明文节点和远程订阅链接
     for (let x of urls) {
@@ -406,11 +399,9 @@ async function resolveLinksToNodes(text, request, userAgentHeader, returnMeta = 
         );
 
         req_data += res[0].join('\n');
-        if (Array.isArray(res[2])) errors.push(...res[2]);
     }
 
-    const result = selfBuilt + (selfBuilt && req_data ? '\n' : '') + req_data;
-    return returnMeta ? { text: result, errors } : result;
+    return selfBuilt + (selfBuilt && req_data ? '\n' : '') + req_data;
 }
 
 
@@ -515,7 +506,9 @@ function processNodes(content, config) {
                         config.replaceWith || ''
                     );
                 } catch (e) {
-                    throw new Error('替换正则表达式错误：' + e.message);
+                    node.name = node.name
+                        .split(config.replaceTarget)
+                        .join(config.replaceWith || '');
                 }
             }
 
@@ -781,7 +774,6 @@ async function handleAdminUI(
                 const textData = await request.text();
                 const data = JSON.parse(textData);
                 if (typeof data.links !== 'string' || typeof data.customNodes !== 'string' || !data.config || typeof data.config !== 'object' || Array.isArray(data.config)) throw new Error('配置数据格式错误');
-                for (const key of ['retainNameRegex','dropNameRegex','replaceTarget']) if(data.config[key]) { try { new RegExp(data.config[key], key==='replaceTarget'?'gi':'i'); } catch(e) { throw new Error(key+' 正则表达式错误：'+e.message); } }
                 const limit = Number(data.config.outputLimit || 0);
                 if (!Number.isInteger(limit) || limit < 0 || limit > 100000) throw new Error('节点数量限制须为 0 至 100000 的整数');
                 if (data.config.favorites !== undefined && (!Array.isArray(data.config.favorites) || data.config.favorites.some(x => typeof x !== 'string'))) throw new Error('收藏节点数据格式错误');
@@ -807,11 +799,10 @@ async function handleAdminUI(
     let hasKV = !!env.KV;
 
     if (hasKV) {
-        const snapshot = await env.KV.get('CONFIG_SNAPSHOT.json');
-        if (snapshot) { try { const committed=JSON.parse(snapshot); content=committed.links||''; customNodes=committed.customNodes||''; Object.assign(configObj,committed.config||{}); } catch (_) {} }
-        else { content = await env.KV.get('LINK.txt') || ''; customNodes = await env.KV.get('CUSTOM_NODES.txt') || ''; }
+        content = await env.KV.get('LINK.txt') || '';
+        customNodes = await env.KV.get('CUSTOM_NODES.txt') || '';
 
-        let kvCfg = snapshot ? null : await env.KV.get('EDIT_CONFIG.json');
+        let kvCfg = await env.KV.get('EDIT_CONFIG.json');
 
         if (kvCfg) {
             try {
@@ -1088,13 +1079,11 @@ function renderDashboardHTML(
     <script>
         // 前端保存独立状态
         window.CURRENT_SPECIFIC_RULES = ${JSON.stringify(configObj.specificRules || {})};
-        window.CURRENT_FAVORITES = ${JSON.stringify(Array.isArray(configObj.favorites) ? configObj.favorites : [])};
     </script>
 
     <nav class="glass-card sticky top-0 z-50 border-b-0 border-white/10 mb-8 rounded-b-3xl">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
             <div class="flex items-center gap-3">
-                <div class="hidden md:block text-right text-[11px] font-mono text-gray-300"><div>CN 时间 <span id="cnClock"></span></div><div>UTC 时间 <span id="utcClock"></span></div></div>
                 <div class="w-10 h-10 rounded-full flex items-center justify-center border border-[var(--neon-cyan)] shadow-[0_0_10px_rgba(0,243,255,0.3)] bg-black/30">
                     <svg class="w-5 h-5 text-[var(--neon-cyan)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a6 6 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A6 6 0 009 10.172V5L8 4z"></path>
@@ -1142,7 +1131,7 @@ function renderDashboardHTML(
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path>
                             </svg>
-                            保存所有配置
+                            保存配置(最终生效)
                         </button>
                     </div>
                 </div>
@@ -1187,8 +1176,6 @@ function renderDashboardHTML(
                 </div>
 
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div class="col-span-2 md:col-span-4 flex flex-wrap gap-2 p-3 rounded-lg bg-black/20"><input id="quickFind" class="glass-input rounded p-2 text-xs" placeholder="查找节点名称"><button id="findBtn" class="border rounded px-3 text-xs">查找</button><button id="clearFindBtn" class="border rounded px-3 text-xs">清除查找</button><span id="matchCount" class="text-xs text-gray-400 self-center"></span></div>
-                    <div class="col-span-2 md:col-span-4 flex items-center gap-3 rounded-lg border border-white/10 p-3"><label class="text-xs text-gray-300" for="cfg_outputLimit">最终输出节点数（0 表示不限制）</label><input type="number" min="0" max="100000" id="cfg_outputLimit" value="${Number(configObj.outputLimit || 0)}" class="glass-input w-28 p-2 text-xs rounded-lg"><span class="text-[10px] text-gray-500">收藏节点优先保留</span></div>
                     <div class="md:col-span-2">
                         <label class="text-[10px] text-[var(--neon-purple)] block mb-1">查找关键字 (在下方预览中将高亮展示被删内容)</label>
                         <input type="text" id="cfg_replaceTarget" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceTarget || ''}" placeholder="例: @clashV8">
@@ -1225,7 +1212,6 @@ function renderDashboardHTML(
                             <input type="text" id="cfg_addSuffix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
                         </div>
                     </div>
-                    <div class="md:col-span-4 flex flex-wrap gap-2 mt-2"><button data-rule="replace" class="rule-run border rounded-lg px-3 py-2 text-xs">替换</button><button data-rule="retain" class="rule-run border rounded-lg px-3 py-2 text-xs">执行保留</button><button data-rule="drop" class="rule-run border rounded-lg px-3 py-2 text-xs">执行剔除</button><button data-rule="rename" class="rule-run border rounded-lg px-3 py-2 text-xs">执行重命名</button><button data-rule="prefix" class="rule-run border rounded-lg px-3 py-2 text-xs">添加前缀</button><button data-rule="suffix" class="rule-run border rounded-lg px-3 py-2 text-xs">添加后缀</button></div>
                 </div>
             </div>
 
@@ -1237,7 +1223,7 @@ function renderDashboardHTML(
             </div>
 
             <!-- 4. 实时节点预览区域 -->
-            <div id="previewSection" class="glass-card rounded-2xl p-6 flex flex-col border border-[var(--neon-cyan)] shadow-[0_0_20px_rgba(0,243,255,0.15)] mt-2">
+            <div id="previewSection" class="glass-card rounded-2xl p-6 hidden flex-col border border-[var(--neon-cyan)] shadow-[0_0_20px_rgba(0,243,255,0.15)] mt-2">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-lg font-bold text-[var(--neon-cyan)] tracking-wide flex items-center gap-2">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1247,7 +1233,7 @@ function renderDashboardHTML(
                         实时节点预览 (Live Preview)
                     </h2>
 
-                    <button onclick="document.getElementById('previewContent').classList.toggle('hidden')" class="text-gray-400 hover:text-white text-xs border border-gray-600 px-3 py-1 rounded-full hover:bg-white/10 transition">
+                    <button onclick="document.getElementById('previewSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xs border border-gray-600 px-3 py-1 rounded-full hover:bg-white/10 transition">
                         ✕ 关闭
                     </button>
                 </div>
@@ -1277,9 +1263,9 @@ function renderDashboardHTML(
         <div class="lg:col-span-5 flex flex-col gap-6">
             <div class="glass-card rounded-2xl p-6 relative overflow-hidden">
                 <div class="absolute -top-10 -right-10 w-32 h-32 bg-[var(--neon-cyan)] rounded-full mix-blend-screen filter blur-[60px] opacity-20 pointer-events-none"></div>
-                <div class="flex justify-between items-center cursor-pointer" onclick="document.getElementById('mySubsContent').classList.toggle('hidden')"><h2 class="text-lg font-bold text-white mb-1 tracking-wide">专属地址 My Subs</h2><button type="button" class="text-xs border border-white/20 rounded px-3 py-1">折叠/展开</button></div>
+                <h2 class="text-lg font-bold text-white mb-1 tracking-wide">专属地址 My Subs</h2>
 
-                <div id="mySubsContent" class="grid grid-cols-2 gap-4 mt-5">
+                <div class="grid grid-cols-2 gap-4 mt-5">
                     ${subItems.map(item => generateSubCard(item, 'qr_my')).join('')}
                 </div>
             </div>
@@ -1462,15 +1448,10 @@ function renderDashboardHTML(
                         ? document.getElementById('cfg_replaceWith').value
                         : '',
 
-                    outputLimit: Number(document.getElementById('cfg_outputLimit')?.value || 0),
-                    favorites: window.CURRENT_FAVORITES || [],
-
                     specificRules: window.CURRENT_SPECIFIC_RULES
                 }
             };
         }
-
-        function validatePayload(payload){if(!Number.isInteger(payload.config.outputLimit)||payload.config.outputLimit<0||payload.config.outputLimit>100000)throw new Error('节点数量限制必须是 0 至 100000 的整数');for(const key of ['retainNameRegex','dropNameRegex','replaceTarget'])if(payload.config[key]){try{new RegExp(payload.config[key]);}catch(e){throw new Error(key+' 正则错误：'+e.message);}}}
 
 
         // ================= 前端核心：请求真实预览 =================
@@ -1483,7 +1464,6 @@ function renderDashboardHTML(
 
                 try {
                     const payload = getPayload();
-                    validatePayload(payload);
                     const targetKw = payload.config.replaceTarget;
 
                     const res = await fetch('/preview', {
@@ -1501,7 +1481,6 @@ function renderDashboardHTML(
                     if (resJson.error) {
                         throw new Error(resJson.error);
                     }
-                    if(resJson.sourceErrors?.length)showToast(resJson.sourceErrors.map(x=>x.url+'：'+x.error).join('；'),'error');
 
                     let htmlContent = '<ul class="space-y-3">';
 
@@ -1551,7 +1530,6 @@ function renderDashboardHTML(
                                 <li class="p-3 rounded-xl border \${borderClass} transition-all duration-300 flex items-start gap-3 relative overflow-hidden group">
                                     \${!isCustom ? \`<input type="checkbox" class="node-checkbox form-checkbox h-4 w-4 mt-1.5 text-[var(--neon-cyan)] rounded border-gray-600 bg-black cursor-pointer" value="\${node.identifier}">\` : '<span class="w-4"></span>'}
 
-                                    <button type="button" title="收藏/取消收藏" class="favorite-toggle text-yellow-300 hover:text-yellow-100" data-fav="${node.stableId || node.identifier}">☆</button>
                                     <div class="flex-1 min-w-0">
                                         <div class="flex items-center gap-2 mb-1.5">
                                             <span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-700/80 text-gray-300 border border-gray-600 uppercase tracking-wider">
@@ -1591,10 +1569,7 @@ function renderDashboardHTML(
                     htmlContent += '</ul>';
 
                     document.getElementById('previewContent').innerHTML = htmlContent;
-                    document.querySelectorAll('.favorite-toggle').forEach(b=>{b.textContent=(window.CURRENT_FAVORITES||[]).includes(b.dataset.fav)?'★':'☆';});
-                    const allCount=(resJson.nodes||[]).length+(resJson.customNodes||[]).length;
-                    document.getElementById('matchCount').textContent='输出预览 '+allCount+' 个节点';
-                    if(payload.config.outputLimit>0&&(window.CURRENT_FAVORITES||[]).length>payload.config.outputLimit)showToast('收藏节点数量超过设定上限，实际输出将保留全部收藏节点','error');
+
                     // 绑定选中框事件
                     document.querySelectorAll('.node-checkbox').forEach(cb => {
                         cb.addEventListener('change', () => {
@@ -1622,12 +1597,6 @@ function renderDashboardHTML(
             };
         }
 
-        document.getElementById('findBtn')?.addEventListener('click',()=>{const q=document.getElementById('quickFind').value.trim().toLowerCase();let n=0;document.querySelectorAll('#previewContent li').forEach(li=>{const ok=!q||li.textContent.toLowerCase().includes(q);li.style.display=ok?'':'none';if(ok)n++;});document.getElementById('matchCount').textContent='匹配 '+n+' 项（查找只影响显示）';});
-        document.getElementById('clearFindBtn')?.addEventListener('click',()=>{document.getElementById('quickFind').value='';document.querySelectorAll('#previewContent li').forEach(li=>li.style.display='');document.getElementById('matchCount').textContent='显示全部节点';});
-        document.getElementById('previewContent')?.addEventListener('click',e=>{const b=e.target.closest('.favorite-toggle');if(!b)return;const s=moduleState.preview,before=readModule('preview');const id=b.dataset.fav;const set=new Set(window.CURRENT_FAVORITES||[]);if(set.has(id))set.delete(id);else set.add(id);window.CURRENT_FAVORITES=[...set];if(s){s.undo.push(before);if(s.undo.length>10)s.undo.shift();s.redo=[];}showToast(set.has(id)?'已收藏节点':'已取消收藏');document.getElementById('previewBtn')?.click();});
-        document.getElementById('customNodes')?.addEventListener('change',()=>document.getElementById('previewBtn')?.click());
-        document.querySelectorAll('.rule-run').forEach(b=>b.addEventListener('click',()=>{const ids={replace:['cfg_retainNameRegex','cfg_dropNameRegex','cfg_globalRename','cfg_addPrefix','cfg_addSuffix'],retain:['cfg_replaceTarget','cfg_replaceWith','cfg_dropNameRegex','cfg_globalRename','cfg_addPrefix','cfg_addSuffix'],drop:['cfg_replaceTarget','cfg_replaceWith','cfg_retainNameRegex','cfg_globalRename','cfg_addPrefix','cfg_addSuffix'],rename:['cfg_replaceTarget','cfg_replaceWith','cfg_retainNameRegex','cfg_dropNameRegex','cfg_addPrefix','cfg_addSuffix'],prefix:['cfg_replaceTarget','cfg_replaceWith','cfg_retainNameRegex','cfg_dropNameRegex','cfg_globalRename','cfg_addSuffix'],suffix:['cfg_replaceTarget','cfg_replaceWith','cfg_retainNameRegex','cfg_dropNameRegex','cfg_globalRename','cfg_addPrefix']};const s=moduleState.rules;s.undo.push(readModule('rules'));if(s.undo.length>10)s.undo.shift();s.redo=[];for(const id of ids[b.dataset.rule]||[]){const e=document.getElementById(id);if(e)e.value='';}document.getElementById('previewBtn')?.click();}));
-
 
         // ================= 前端核心：专有规则附加 =================
         const applyBatchBtn = document.getElementById('applyBatchBtn');
@@ -1648,8 +1617,6 @@ function renderDashboardHTML(
                     showToast('前缀或后缀请至少填写一项！', 'error');
                     return;
                 }
-
-                const rulesState=moduleState.rules;rulesState.undo.push(readModule('rules'));if(rulesState.undo.length>10)rulesState.undo.shift();rulesState.redo=[];
 
                 checked.forEach(cb => {
                     const id = cb.value;
@@ -1679,7 +1646,6 @@ function renderDashboardHTML(
 
         if (clearBatchBtn) {
             clearBatchBtn.onclick = () => {
-                const rulesState=moduleState.rules;rulesState.undo.push(readModule('rules'));if(rulesState.undo.length>10)rulesState.undo.shift();rulesState.redo=[];
                 window.CURRENT_SPECIFIC_RULES = {};
                 showToast('已清空所有专属前后缀规则！');
 
@@ -1689,23 +1655,6 @@ function renderDashboardHTML(
             };
         }
 
-
-        // 模块级暂存与独立历史；暂存仅存在当前页面内，只有全局提交会写 KV。
-        const moduleDefs={sources:['content'],rules:['cfg_autoEmoji','cfg_deepDeduplicate','cfg_sortNodes','cfg_dropInvalidNodes','cfg_globalRename','cfg_addPrefix','cfg_addSuffix','cfg_retainNameRegex','cfg_dropNameRegex','cfg_replaceTarget','cfg_replaceWith'],custom:['customNodes'],preview:['cfg_outputLimit']};
-        const moduleState={};
-        function readModule(key){const out={};for(const id of moduleDefs[key]){const e=document.getElementById(id);if(e)out[id]=e.type==='checkbox'?e.checked:e.value;}if(key==='preview')out.favorites=[...(window.CURRENT_FAVORITES||[])];if(key==='rules')out.specificRules=JSON.parse(JSON.stringify(window.CURRENT_SPECIFIC_RULES||{}));return out;}
-        function applyModule(key,obj){for(const [id,v] of Object.entries(obj||{})){if(id==='favorites'){window.CURRENT_FAVORITES=[...v];continue;}if(id==='specificRules'){window.CURRENT_SPECIFIC_RULES=JSON.parse(JSON.stringify(v));continue;}const e=document.getElementById(id);if(e)e.type==='checkbox'?e.checked=v:e.value=v;}}
-        function mountModuleTools(key,el){if(!el)return;const bar=document.createElement('div');bar.className='flex gap-2 mt-3 flex-wrap';bar.innerHTML='<button data-act="stage">保存配置</button><button data-act="cancel">取消恢复</button><button data-act="undo">撤销</button><button data-act="redo">重做</button><span class="text-xs text-gray-400 self-center" data-status>未修改</span>';bar.querySelectorAll('button').forEach(b=>{b.className='border border-white/20 rounded-lg px-3 py-1.5 text-xs text-gray-200 hover:border-cyan-400';b.onclick=()=>{const s=moduleState[key];if(b.dataset.act==='stage'){s.staged=readModule(key);bar.querySelector('[data-status]').textContent='已暂存，等待全局保存';}else if(b.dataset.act==='cancel'){applyModule(key,s.staged||s.base);bar.querySelector('[data-status]').textContent='已恢复';}else if(b.dataset.act==='undo'||b.dataset.act==='redo'){const from=b.dataset.act==='undo'?s.undo:s.redo,to=b.dataset.act==='undo'?s.redo:s.undo;if(!from.length)return;to.push(readModule(key));if(to.length>10)to.shift();applyModule(key,from.pop());bar.querySelector('[data-status]').textContent='已'+(b.dataset.act==='undo'?'撤销':'重做');}});el.appendChild(bar);const s=moduleState[key]={base:readModule(key),staged:null,undo:[],redo:[]};for(const id of moduleDefs[key]){const e=document.getElementById(id);if(e){e.addEventListener('focus',()=>s.focusSnapshot=readModule(key));e.addEventListener('change',()=>{const before=s.focusSnapshot||s.base;if(JSON.stringify(before)!==JSON.stringify(readModule(key))){s.undo.push(before);if(s.undo.length>10)s.undo.shift();s.redo=[];s.focusSnapshot=readModule(key);}bar.querySelector('[data-status]').textContent='有未暂存修改';});}}}
-        mountModuleTools('sources',document.getElementById('content')?.parentElement);
-        mountModuleTools('rules',document.getElementById('cfg_outputLimit')?.closest('.glass-card'));
-        mountModuleTools('custom',document.getElementById('customNodes')?.parentElement);
-        mountModuleTools('preview',document.getElementById('previewSection'));
-        for(const s of Object.values(moduleState))s.staged=s.base;
-        const sourcePanel=document.getElementById('content')?.parentElement;
-        if(sourcePanel&&document.getElementById('previewBtn'))sourcePanel.appendChild(document.getElementById('previewBtn'));
-        const limitRow=document.getElementById('cfg_outputLimit')?.parentElement;if(limitRow)document.getElementById('previewSection')?.insertBefore(limitRow,document.getElementById('previewContent'));
-        const customModule=document.getElementById('customNodes')?.parentElement, previewModule=document.getElementById('previewSection');
-        if(customModule&&previewModule&&customModule.parentElement===previewModule.parentElement)customModule.parentElement.insertBefore(previewModule,customModule);
 
         // 全局唯一保存机制
         const btn = document.getElementById('saveBtn');
@@ -1723,9 +1672,6 @@ function renderDashboardHTML(
 
                 try {
                     const payload = getPayload();
-                    for(const [key,state] of Object.entries(moduleState)){if(JSON.stringify(readModule(key))!==JSON.stringify(state.staged||state.base))throw new Error('模块 '+key+' 有未暂存修改，请先点击该模块的保存配置');}
-                    for(const [key,st] of Object.entries(moduleState)){const staged=st.staged||st.base;for(const [id,value] of Object.entries(staged||{})){if(id==='content')payload.links=decodeNodeNameSafe(value);else if(id==='customNodes')payload.customNodes=decodeNodeNameSafe(value);else if(id==='favorites')payload.config.favorites=value;else if(id==='specificRules')payload.config.specificRules=value;else {const prop=id==='cfg_outputLimit'?'outputLimit':id.replace(/^cfg_/,'');payload.config[prop]=id==='cfg_outputLimit'?Number(value):value;}}}
-                    validatePayload(payload);
 
                     document.getElementById('content').value = payload.links;
                     document.getElementById('customNodes').value = payload.customNodes;
@@ -1737,21 +1683,20 @@ function renderDashboardHTML(
                     });
 
                     if (res.ok) {
-                        for(const key of Object.keys(moduleState)){const v=moduleState[key].staged||moduleState[key].base;applyModule(key,v);moduleState[key].base=v;moduleState[key].undo=[];moduleState[key].redo=[];}
                         document.getElementById('saveStatus').innerHTML =
                             '<span class="text-[var(--neon-cyan)]">✓ 保存于 ' +
-                            new Date().toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) +
+                            new Date().toLocaleTimeString() +
                             '</span>';
 
                         showToast('配置数据已安全存入底层 KV！已对外部订阅链接完全生效。');
                     } else {
-                        showToast('保存失败：'+await res.text(), 'error');
+                        showToast('保存失败，请检查网络', 'error');
                     }
 
                 } catch (e) {
-                    showToast(e.message || '网络异常', 'error');
+                    showToast('网络异常', 'error');
                 } finally {
-                    btn.innerHTML = '<svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> 保存所有配置';
+                    btn.innerHTML = '<svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> 保存配置(最终生效>';
                     btn.disabled = false;
                     btn.style.filter = "brightness(1)";
                 }
@@ -1777,10 +1722,6 @@ function renderDashboardHTML(
                 btn.textContent = '展开 ▼';
             }
         }
-
-        // 两个时区使用同一个时间戳，避免浏览器本地时区造成偏差。
-        function updateClocks(){const now=new Date();const fmt=(tz)=>new Intl.DateTimeFormat('sv-SE',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(now);const cn=document.getElementById('cnClock'),utc=document.getElementById('utcClock');if(cn)cn.textContent=fmt('Asia/Shanghai');if(utc)utc.textContent=fmt('UTC');}
-        updateClocks();setInterval(updateClocks,1000);
 
 
         // 注入美化滚动条
@@ -1967,7 +1908,6 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
     let newapi = '';
     let 异常订阅 = '';
     let 订阅转换URLs = '';
-    const failures = [];
 
     const controller = new AbortController();
 
@@ -1995,7 +1935,6 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
 
         responses.forEach((response, index) => {
             if (response.status !== 'fulfilled') {
-                failures.push({ url: sources[index], error: String(response.reason?.message || response.reason || '抓取失败') });
                 console.warn(
                     '订阅源抓取失败:',
                     sources[index],
@@ -2036,7 +1975,6 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
                     try {
                         newapi += base64Decode(compact) + '\n';
                     } catch (error) {
-                        failures.push({ url: sources[index], error: 'Base64 解码失败：' + error.message });
                         console.warn(
                             '订阅 Base64 解码失败:',
                             sources[index],
@@ -2046,7 +1984,6 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
                         异常订阅 += anomalyNode;
                     }
                 } else {
-                    failures.push({ url: sources[index], error: '订阅内容既非明文节点也非有效 Base64' });
                     异常订阅 += anomalyNode;
                 }
             }
@@ -2061,7 +1998,6 @@ async function getSUB(api, request, 追加UA, userAgentHeader) {
 
     return [
         await ADD(newapi + 异常订阅),
-        订阅转换URLs,
-        failures
+        订阅转换URLs
     ];
 }
