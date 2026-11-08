@@ -28,8 +28,22 @@ const DEFAULT_NODE_EDIT_CONFIG = {
     replaceTarget: '', replaceWith: '',
     globalRename: '', addPrefix: '', addSuffix: '',
     autoEmoji: true, deepDeduplicate: true, sortNodes: true, dropInvalidNodes: true,
-    specificRules: {} // 专属节点的特殊前后缀规则
+    specificRules: {}, // 专属节点的特殊前后缀规则
+    outputLimit: 0, favorites: []
 };
+
+function chooseOutputNodes(nodes, config) {
+    const limit = Number(config?.outputLimit || 0);
+    if (!Number.isInteger(limit) || limit < 0) throw new Error('节点数量限制必须是非负整数');
+    const favorites = new Set(Array.isArray(config?.favorites) ? config.favorites : []);
+    const pinned = nodes.filter(n => n.valid && favorites.has(nodeStableId(n)));
+    const ordinary = nodes.filter(n => !n.valid || !favorites.has(nodeStableId(n)));
+    if (!limit || nodes.length <= limit || pinned.length >= limit) return pinned.length >= limit && limit ? [...pinned, ...ordinary.filter(n=>!n.valid)] : nodes;
+    const pool = ordinary.filter(n => n.valid);
+    for (let i=pool.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [pool[i],pool[j]]=[pool[j],pool[i]]; }
+    return [...pinned, ...pool.slice(0, Math.max(0, limit-pinned.length)), ...ordinary.filter(n=>!n.valid)];
+}
+function nodeStableId(n) { return n.protocol === 'vmess' ? `${n.protocol}://${n.address}:${n.port}/${n.id}` : `${n.protocol}://${n.address}:${n.port}/${n.id || ''}`; }
 
 export default {
     async fetch(request, env) {
@@ -183,14 +197,18 @@ export default {
                 if (userAgent.includes('mozilla') && !url.search) {
                     return Response.redirect(`${url.origin}/admin`, 302);
                 } else {
+                    let snapshot = await env.KV.get('CONFIG_SNAPSHOT.json');
+                    if (snapshot) {
+                        try { const committed = JSON.parse(snapshot); MainData = committed.links ?? MainData; customOutputNodes = committed.customNodes ?? ''; Object.assign(dynamicConfig, committed.config || {}); } catch (_) {}
+                    } else {
                     MainData = await env.KV.get('LINK.txt') || MainData;
                     customOutputNodes = await env.KV.get('CUSTOM_NODES.txt') || "";
-
                     let kvCfg = await env.KV.get('EDIT_CONFIG.json');
                     if (kvCfg) {
                         try {
                             Object.assign(dynamicConfig, JSON.parse(kvCfg));
                         } catch (e) {}
+                    }
                     }
                 }
             } else {
@@ -279,11 +297,8 @@ export default {
             );
 
             // 合并输出
-            let finalOutput = buildSubString(nodeArray);
-
-            if (customArray.length > 0) {
-                finalOutput += (finalOutput ? '\n' : '') + buildSubString(customArray);
-            }
+            let outputNodes = chooseOutputNodes([...nodeArray, ...processNodes(customOutputNodes, Object.assign({}, dynamicConfig, { isCustom: true }))], dynamicConfig);
+            let finalOutput = buildSubString(outputNodes);
 
             let base64Data;
 
@@ -758,12 +773,16 @@ async function handleAdminUI(
             try {
                 const textData = await request.text();
                 const data = JSON.parse(textData);
+                if (typeof data.links !== 'string' || typeof data.customNodes !== 'string' || !data.config || typeof data.config !== 'object' || Array.isArray(data.config)) throw new Error('配置数据格式错误');
+                const limit = Number(data.config.outputLimit || 0);
+                if (!Number.isInteger(limit) || limit < 0 || limit > 100000) throw new Error('节点数量限制须为 0 至 100000 的整数');
+                if (data.config.favorites !== undefined && (!Array.isArray(data.config.favorites) || data.config.favorites.some(x => typeof x !== 'string'))) throw new Error('收藏节点数据格式错误');
+                const snapshot = JSON.stringify({ version: 1, links: data.links, customNodes: data.customNodes, config: data.config, committedAt: new Date().toISOString() });
+                await env.KV.put('CONFIG_SNAPSHOT.json', snapshot);
+                // 兼容旧版本后台/订阅入口；正式订阅优先读取上方单键提交快照。
+                await Promise.allSettled([env.KV.put('LINK.txt', data.links), env.KV.put('CUSTOM_NODES.txt', data.customNodes), env.KV.put('EDIT_CONFIG.json', JSON.stringify(data.config))]);
 
-                await env.KV.put('LINK.txt', data.links || '');
-                await env.KV.put('CUSTOM_NODES.txt', data.customNodes || '');
-                await env.KV.put('EDIT_CONFIG.json', JSON.stringify(data.config || {}));
-
-                return new Response("保存成功", { status: 200 });
+                return new Response(JSON.stringify({ ok: true, committedAt: JSON.parse(snapshot).committedAt }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
             } catch (e) {
                 return new Response("JSON 解析异常: " + e.message, { status: 400 });
             }
