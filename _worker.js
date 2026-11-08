@@ -68,20 +68,22 @@ export default {
         let expire = Math.floor(timestamp / 1000);
         SUBUpdateTime = env.SUBUPTIME || SUBUpdateTime;
 
-        // ====== 【新增功能：提供 /preview 接口给前端动态生成预览】开始 ======
+        // ====== 【修复：预览接口改为接收文本再尝试解析】开始 ======
         if (request.method === 'POST' && url.pathname === '/preview') {
             try {
-                const data = await request.json();
+                const textData = await request.text();
+                const data = JSON.parse(textData);
                 let result = processAndEditSubNodes(data.links || '', data.config || {});
                 if (data.customNodes && data.customNodes.trim()) {
                     result += '\n' + data.customNodes.trim();
                 }
                 return new Response(result, { status: 200, headers: { "Content-Type": "text/plain;charset=utf-8" } });
             } catch (e) {
-                return new Response("解析异常", { status: 400 });
+                console.error("Preview Parse Error:", e);
+                return new Response("解析异常: " + e.message, { status: 400 });
             }
         }
-        // ====== 【新增功能：提供 /preview 接口给前端动态生成预览】结束 ======
+        // ====== 【修复：预览接口改为接收文本再尝试解析】结束 ======
 
         if (url.pathname === '/admin' || url.pathname === '/login' || url.pathname === '/logout' || url.pathname === '/') {
             const sessionToken = await MD5MD5(AdminUser + AdminPass + "CF-SUB-SECURE");
@@ -249,13 +251,15 @@ async function handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, g
         const contentType = request.headers.get('content-type') || '';
         if (contentType.includes('application/json')) {
             try {
-                const data = await request.json();
+                const textData = await request.text();
+                const data = JSON.parse(textData);
                 await env.KV.put('LINK.txt', data.links || '');
                 await env.KV.put('CUSTOM_NODES.txt', data.customNodes || '');
                 await env.KV.put('EDIT_CONFIG.json', JSON.stringify(data.config || {}));
                 return new Response("保存成功", { status: 200 });
             } catch(e) {
-                return new Response("JSON 解析异常", { status: 400 });
+                console.error("Save Parse Error:", e);
+                return new Response("JSON 解析异常: " + e.message, { status: 400 });
             }
         } else {
             const content = await request.text();
@@ -378,11 +382,9 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                     </div>
                     <div class="flex items-center gap-3">
                         <span id="saveStatus" class="text-xs text-[var(--neon-cyan)] font-mono mr-2"></span>
-                        <!-- ====== 【新增功能：预览按钮】开始 ====== -->
                         <button id="previewBtn" class="glass-card flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-white hover:text-[var(--neon-cyan)] hover:border-[var(--neon-cyan)] transition-all cursor-pointer">
                             🔍 预览结果
                         </button>
-                        <!-- ====== 【新增功能：预览按钮】结束 ====== -->
                         <button id="saveBtn" class="neon-btn flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-black cursor-pointer">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
                             保存配置
@@ -419,7 +421,6 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                 </div>
 
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <!-- ====== 【新增功能：UI 查找替换框】开始 ====== -->
                     <div class="md:col-span-2">
                         <label class="text-[10px] text-[var(--neon-purple)] block mb-1">查找关键字 (精准替换)</label>
                         <input type="text" id="cfg_replaceTarget" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceTarget || ''}" placeholder="例: @clashV8">
@@ -428,7 +429,6 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                         <label class="text-[10px] text-[var(--neon-purple)] block mb-1">替换为 (留空则直接删除该词)</label>
                         <input type="text" id="cfg_replaceWith" class="glass-input w-full p-2 text-xs rounded-lg border-[var(--neon-purple)]/50" value="${configObj.replaceWith || ''}" placeholder="例: 星链">
                     </div>
-                    <!-- ====== 【新增功能：UI 查找替换框】结束 ====== -->
 
                     <div>
                         <label class="text-[10px] text-gray-400 block mb-1 mt-2">正则保留(名称)</label>
@@ -461,16 +461,16 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                 <textarea id="customNodes" class="glass-input w-full p-4 h-[80px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴需要强制置入的自建节点...">${customNodes}</textarea>
             </div>
             
-            <!-- ====== 【新增功能：预览效果展示区】开始 ====== -->
             <div id="previewSection" class="glass-card rounded-2xl p-6 hidden flex-col border border-[var(--neon-cyan)] shadow-[0_0_20px_rgba(0,243,255,0.2)]">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-lg font-bold text-[var(--neon-cyan)] tracking-wide">节点预览结果 (Preview)</h2>
                     <button onclick="document.getElementById('previewSection').classList.add('hidden')" class="text-gray-400 hover:text-white text-xs border border-gray-600 px-3 py-1 rounded-full">✕ 关闭预览</button>
                 </div>
                 <p class="text-[11px] text-gray-400 mb-2 font-mono">以下是经过你的规则处理后，最终分发给客户端的节点名称，确认无误后请点击【保存配置】</p>
-                <textarea id="previewContent" class="glass-input w-full p-4 h-[300px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-blue-300 bg-black/40" readonly></textarea>
+                <!-- ====== 【改进：使用 HTML 内容展示，支持高亮和列表】开始 ====== -->
+                <div id="previewContent" class="glass-input w-full p-4 h-[350px] font-mono text-[13px] rounded-xl overflow-y-auto leading-relaxed text-blue-300 bg-black/40"></div>
+                <!-- ====== 【改进：使用 HTML 内容展示，支持高亮和列表】结束 ====== -->
             </div>
-            <!-- ====== 【新增功能：预览效果展示区】结束 ====== -->
 
             ` : ''}
             
@@ -585,7 +585,6 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
             };
         }
 
-        // ====== 【新增功能：处理前端预览请求动作】开始 ======
         const previewBtn = document.getElementById('previewBtn');
         if (previewBtn) {
             previewBtn.onclick = async () => {
@@ -593,45 +592,80 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                 previewBtn.disabled = true;
                 try {
                     const payload = getPayload();
-                    const res = await fetch('/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    const replaceTarget = payload.config.replaceTarget;
+                    
+                    const res = await fetch('/preview', { 
+                        method: 'POST', 
+                        headers: { 'Content-Type': 'application/json' }, 
+                        body: JSON.stringify(payload) 
+                    });
+                    
+                    if (!res.ok) throw new Error(await res.text());
+                    
                     let text = await res.text();
                     
-                    // 为了让预览极其直观，我们将后端的机器节点格式解析成人类可读格式
-                    text = text.split('\\n').map(line => {
-                        let name = ''; let type = '';
-                        if (line.startsWith('vmess://')) {
-                            try {
-                                let b64Str = line.substring(8).replace(/-/g, '+').replace(/_/g, '/');
-                                while (b64Str.length % 4 !== 0) b64Str += '=';
-                                let jsonStr = decodeURIComponent(atob(b64Str).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-                                name = JSON.parse(jsonStr).ps; type = 'VMESS';
-                            } catch(e) { name = '解析失败'; type = 'VMESS'; }
-                        } else if (line.includes('://')) {
-                            let hashIndex = line.lastIndexOf('#');
-                            if (hashIndex !== -1) {
-                                try { name = decodeURIComponent(line.substring(hashIndex + 1)); } 
-                                catch(e) { name = line.substring(hashIndex + 1); }
+                    // ====== 【改进：将预览结果格式化为带高亮的 HTML】开始 ======
+                    let htmlContent = '';
+                    const lines = text.split('\\n').filter(line => line.trim() !== '');
+                    
+                    if (lines.length === 0) {
+                        htmlContent = '<p class="text-red-400">没有节点数据，或所有节点都被过滤掉了。</p>';
+                    } else {
+                        htmlContent = '<ul class="space-y-3">';
+                        lines.forEach((line, index) => {
+                            let name = ''; let type = '';
+                            if (line.startsWith('vmess://')) {
+                                try {
+                                    let b64Str = line.substring(8).replace(/-/g, '+').replace(/_/g, '/');
+                                    while (b64Str.length % 4 !== 0) b64Str += '=';
+                                    let jsonStr = decodeURIComponent(atob(b64Str).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+                                    name = JSON.parse(jsonStr).ps; type = 'VMESS';
+                                } catch(e) { name = '解析失败'; type = 'VMESS'; }
+                            } else if (line.includes('://')) {
+                                let hashIndex = line.lastIndexOf('#');
+                                if (hashIndex !== -1) {
+                                    try { name = decodeURIComponent(line.substring(hashIndex + 1)); } 
+                                    catch(e) { name = line.substring(hashIndex + 1); }
+                                }
+                                type = line.split('://')[0].toUpperCase();
+                            } else {
+                                name = line; type = 'OTHER';
                             }
-                            type = line.split('://')[0].toUpperCase();
-                        } else {
-                            return line; // Not a standard node
-                        }
-                        return \`[\${type}] \${name}\\n └─ \${line.substring(0, 45)}...\`;
-                    }).join('\\n\\n');
+                            
+                            // 高亮刚刚被替换的文本 (如果存在)
+                            let display_name = name;
+                            if (replaceTarget && payload.config.replaceWith && name.includes(payload.config.replaceWith)) {
+                                display_name = name.split(payload.config.replaceWith).join(\`<span class="bg-[var(--neon-purple)]/50 px-1 rounded text-white">\${payload.config.replaceWith}</span>\`);
+                            }
 
-                    document.getElementById('previewContent').value = text;
+                            htmlContent += \`
+                                <li class="bg-black/50 p-3 rounded-lg border border-white/5">
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-gray-700/50 text-gray-300">\${index + 1}</span>
+                                        <span class="text-[10px] font-bold px-2 py-0.5 rounded border border-gray-600 text-gray-400">\${type}</span>
+                                        <span class="text-sm font-bold text-[var(--neon-cyan)]">\${display_name}</span>
+                                    </div>
+                                    <div class="text-[10px] text-gray-500 truncate w-full pl-8">\${line}</div>
+                                </li>
+                            \`;
+                        });
+                        htmlContent += '</ul>';
+                    }
+
+                    document.getElementById('previewContent').innerHTML = htmlContent;
+                    // ====== 【改进：将预览结果格式化为带高亮的 HTML】结束 ======
+
                     document.getElementById('previewSection').classList.remove('hidden');
                     document.getElementById('previewSection').classList.add('flex');
                     document.getElementById('previewSection').scrollIntoView({ behavior: 'smooth', block: 'center' });
                 } catch (e) {
-                    alert('预览请求失败，请检查网络');
+                    alert('预览失败: ' + e.message);
                 } finally {
                     previewBtn.innerHTML = '🔍 预览结果';
                     previewBtn.disabled = false;
                 }
             };
         }
-        // ====== 【新增功能：处理前端预览请求动作】结束 ======
 
         const btn = document.getElementById('saveBtn');
         if(btn) {
@@ -643,7 +677,6 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
                 
                 try {
                     const payload = getPayload();
-                    // Update Textareas with decoded clean format
                     document.getElementById('content').value = payload.links;
                     document.getElementById('customNodes').value = payload.customNodes;
 
@@ -680,7 +713,6 @@ function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoke
 
 // ================= 底层基础依赖函数与逻辑 =================
 
-// ====== 【新增功能：核心规则解析与执行模块 (增加查找替换逻辑)】开始 ======
 function processAndEditSubNodes(content, config) {
     let lines = content.split('\n');
     let parsedNodes = [];
@@ -723,8 +755,8 @@ function processAndEditSubNodes(content, config) {
             continue;
         }
 
-        if (config.retainProtocols.length > 0 && !config.retainProtocols.includes(node.protocol)) continue;
-        if (config.dropProtocols.length > 0 && config.dropProtocols.includes(node.protocol)) continue;
+        if (config.retainProtocols && config.retainProtocols.length > 0 && !config.retainProtocols.includes(node.protocol)) continue;
+        if (config.dropProtocols && config.dropProtocols.length > 0 && config.dropProtocols.includes(node.protocol)) continue;
         if (config.retainNameRegex && !new RegExp(config.retainNameRegex, 'i').test(node.name)) continue;
         if (config.dropNameRegex && new RegExp(config.dropNameRegex, 'i').test(node.name)) continue;
 
@@ -734,13 +766,10 @@ function processAndEditSubNodes(content, config) {
             uniqueIdentifiers.add(identifier);
         }
 
-        // 核心修改点：查找并替换逻辑 (在全局覆盖重命名前执行)
         if (config.replaceTarget) {
             try {
-                // 使用不区分大小写的正则替换，能匹配所有出现的位置
                 node.name = node.name.replace(new RegExp(config.replaceTarget, 'gi'), config.replaceWith || '');
             } catch(e) {
-                // 防止输入了非法正则符号导致报错，回退到普通字符串替换
                 node.name = node.name.split(config.replaceTarget).join(config.replaceWith || '');
             }
         }
@@ -821,7 +850,6 @@ function rebuildSingleNode(node) {
         return urlObj.toString();
     }
 }
-// ====== 【新增功能：核心规则解析与执行模块 (增加查找替换逻辑)】结束 ======
 
 async function ADD(envadd) {
     var addtext = envadd.replace(/[  "'|\r\n]+/g, '\n').replace(/\n+/g, '\n');
