@@ -21,32 +21,15 @@ let subConverter = "SUBAPI.cmliussss.net";
 let subConfig = "https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini"; 
 let subProtocol = 'https';
 
-// ====== 【新增配置：节点二次编辑模块】开始 ======
-// 你可以在这里自由修改节点处理规则
-const NODE_EDIT_CONFIG = {
-    // 1. 协议级过滤
-    retainProtocols: [], // 例: ['vless', 'vmess', 'trojan']，留空则不限制
-    dropProtocols: [],   // 例: ['ss']，留空则不剔除
-    
-    // 2. 节点名称正则过滤 (留空则不生效)
-    retainNameRegex: '', // 例: '香港|日本' (只保留名称含香港或日本的节点)
-    dropNameRegex: '',   // 例: '过期|重置|测试' (剔除含这些字眼的节点)
-    
-    // 3. 命名与装饰
-    globalRename: '',    // 全局重命名，留空则不改名 (例: 'MyNode')
-    addPrefix: '',       // 批量添加前缀 (例: '🚀 ')
-    addSuffix: '',       // 批量添加后缀
-    autoEmoji: true,     // 是否自动根据地区关键词补充 Emoji 旗帜
-    
-    // 4. 去重与排序
-    deepDeduplicate: true,  // 深度去重：基于 (协议+IP+端口+ID) 剔除重复节点
-    sortNodes: true,        // 智能排序：信息节点置顶，其余按字母拼音排序
-    
-    // 5. 异常剔除
-    dropInvalidNodes: true  // 剔除无效、无 IP/端口 的坏节点，防止客户端报错
+// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
+// 默认的节点处理配置 (UI 未设置时的初始值)
+const DEFAULT_NODE_EDIT_CONFIG = {
+    retainProtocols: [], dropProtocols: [],
+    retainNameRegex: '', dropNameRegex: '',
+    globalRename: '', addPrefix: '', addSuffix: '',
+    autoEmoji: true, deepDeduplicate: true, sortNodes: true, dropInvalidNodes: true
 };
-// ====== 【新增配置：节点二次编辑模块】结束 ======
-
+// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
 
 export default {
     async fetch(request, env) {
@@ -99,17 +82,26 @@ export default {
             else if (env.URL) return await proxyURL(env.URL, url);
             else return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
         } else {
+            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
+            // 在获取节点数据前，先从 KV 提取用户在面板设置的“二次编辑参数”与“自定义节点”
+            let dynamicConfig = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG);
+            let customOutputNodes = "";
             if (env.KV) {
                 await 迁移地址列表(env, 'LINK.txt');
                 if (userAgent.includes('mozilla') && !url.search) {
                     return Response.redirect(`${url.origin}/admin`, 302);
                 } else {
                     MainData = await env.KV.get('LINK.txt') || MainData;
+                    customOutputNodes = await env.KV.get('CUSTOM_NODES.txt') || "";
+                    let kvCfg = await env.KV.get('EDIT_CONFIG.json');
+                    if (kvCfg) { try { Object.assign(dynamicConfig, JSON.parse(kvCfg)); } catch (e) {} }
                 }
             } else {
                 MainData = env.LINK || MainData;
                 if (env.LINKSUB) urls = await ADD(env.LINKSUB);
             }
+            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
+
             let 重新汇总所有链接 = await ADD(MainData + '\n' + urls.join('\n'));
             let 自建节点 = "";
             let 订阅链接 = "";
@@ -167,10 +159,15 @@ export default {
             const uniqueLines = new Set(text.split('\n'));
             let result = [...uniqueLines].join('\n');
 
-            // ====== 【修改点：核心注入】开始 ======
-            // 替换原有的 renameDuplicateNodes 为全新强大的 processAndEditSubNodes 二次编辑引擎
-            result = processAndEditSubNodes(result, NODE_EDIT_CONFIG);
-            // ====== 【修改点：核心注入】结束 ======
+            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
+            // 核心修改：利用面板传入的动态配置进行过滤、排序与改名
+            result = processAndEditSubNodes(result, dynamicConfig);
+            
+            // 核心修改：追加自定义节点（不受上方任何过滤和重命名的影响）
+            if (customOutputNodes.trim()) {
+                result = result + '\n' + customOutputNodes.trim();
+            }
+            // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
 
             let base64Data;
             try { base64Data = btoa(result); } catch (e) { base64Data = encodeBase64(result); }
@@ -221,7 +218,6 @@ async function handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, g
 
     if (url.pathname === '/') return Response.redirect(`${url.origin}/admin`, 302);
     
-    // 退出逻辑
     if (url.pathname === '/logout') {
         return new Response(null, {
             status: 302,
@@ -229,7 +225,6 @@ async function handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, g
         });
     }
 
-    // 登录验证
     if (request.method === 'POST' && url.pathname === '/login') {
         const formData = await request.formData();
         if (formData.get('username') === AdminUser && formData.get('password') === AdminPass) {
@@ -246,130 +241,87 @@ async function handleAdminUI(request, env, sessionToken, AdminUser, AdminPass, g
         return new Response(renderLoginHTML(), { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
     }
 
-    // --- 已登录后台 ---
+    // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
+    // 处理带 JSON 的 POST 请求，用于统一保存配置、自定义节点、和原始节点
     if (request.method === 'POST' && url.pathname === '/admin') {
         if (!env.KV) return new Response("未绑定KV", { status: 400 });
-        const content = await request.text();
-        await env.KV.put('LINK.txt', content);
-        return new Response("保存成功", { status: 200 });
+        const contentType = request.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+            try {
+                const data = await request.json();
+                await env.KV.put('LINK.txt', data.links || '');
+                await env.KV.put('CUSTOM_NODES.txt', data.customNodes || '');
+                await env.KV.put('EDIT_CONFIG.json', JSON.stringify(data.config || {}));
+                return new Response("保存成功", { status: 200 });
+            } catch(e) {
+                return new Response("JSON 解析异常", { status: 400 });
+            }
+        } else {
+            const content = await request.text();
+            await env.KV.put('LINK.txt', content);
+            return new Response("保存成功", { status: 200 });
+        }
     }
 
     let content = '';
+    let customNodes = '';
+    let configObj = Object.assign({}, DEFAULT_NODE_EDIT_CONFIG);
     let hasKV = !!env.KV;
-    if (hasKV) content = await env.KV.get('LINK.txt') || '';
     
-    return new Response(renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subProtocol, subConverter, subConfig, userAgentHeader), {
+    if (hasKV) {
+        content = await env.KV.get('LINK.txt') || '';
+        customNodes = await env.KV.get('CUSTOM_NODES.txt') || '';
+        let kvCfg = await env.KV.get('EDIT_CONFIG.json');
+        if (kvCfg) { try { Object.assign(configObj, JSON.parse(kvCfg)); } catch (e) {} }
+    }
+    
+    return new Response(renderDashboardHTML(content, customNodes, configObj, guest, url, mytoken, FileName, hasKV, subProtocol, subConverter, subConfig, userAgentHeader), {
         headers: { "Content-Type": "text/html;charset=utf-8" }
     });
+    // ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
 }
 
 // ---------------- UI HTML 模板 ----------------
 const globalCSS = `
 <style>
-    :root {
-        --glass-bg: rgba(17, 25, 40, 0.6);
-        --glass-border: rgba(255, 255, 255, 0.125);
-        --neon-cyan: #00f3ff;
-        --neon-purple: #b026ff;
-    }
-    body {
-        background-color: #0f172a;
-        color: #e2e8f0;
-    }
-    .orb {
-        position: fixed;
-        border-radius: 50%;
-        filter: blur(100px);
-        opacity: 0.4;
-        z-index: -1;
-        animation: float 10s infinite ease-in-out alternate;
-    }
+    :root { --glass-bg: rgba(17, 25, 40, 0.6); --glass-border: rgba(255, 255, 255, 0.125); --neon-cyan: #00f3ff; --neon-purple: #b026ff; }
+    body { background-color: #0f172a; color: #e2e8f0; }
+    .orb { position: fixed; border-radius: 50%; filter: blur(100px); opacity: 0.4; z-index: -1; animation: float 10s infinite ease-in-out alternate; }
     .orb-1 { width: 400px; height: 400px; background: var(--neon-cyan); top: -100px; left: -100px; }
     .orb-2 { width: 500px; height: 500px; background: var(--neon-purple); bottom: -100px; right: -100px; animation-delay: -5s; }
     .orb-3 { width: 300px; height: 300px; background: #ff0055; top: 50%; left: 50%; transform: translate(-50%, -50%); animation-delay: -2s; opacity: 0.2; }
-    
-    @keyframes float {
-        0% { transform: translate(0, 0) scale(1); }
-        100% { transform: translate(30px, 50px) scale(1.1); }
-    }
-    
-    .glass-card {
-        background-color: var(--glass-bg);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid var(--glass-border);
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
-    }
-    .glass-input {
-        background: rgba(0, 0, 0, 0.2);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        color: #fff;
-        transition: all 0.3s;
-    }
-    .glass-input:focus {
-        border-color: var(--neon-cyan);
-        box-shadow: 0 0 15px rgba(0, 243, 255, 0.3);
-        outline: none;
-    }
+    @keyframes float { 0% { transform: translate(0, 0) scale(1); } 100% { transform: translate(30px, 50px) scale(1.1); } }
+    .glass-card { background-color: var(--glass-bg); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid var(--glass-border); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5); }
+    .glass-input { background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.1); color: #fff; transition: all 0.3s; }
+    .glass-input:focus { border-color: var(--neon-cyan); box-shadow: 0 0 15px rgba(0, 243, 255, 0.3); outline: none; }
     .neon-text-cyan { color: var(--neon-cyan); text-shadow: 0 0 8px rgba(0, 243, 255, 0.5); }
     .neon-text-purple { color: #d980ff; text-shadow: 0 0 8px rgba(176, 38, 255, 0.5); }
-    .neon-btn {
-        background: linear-gradient(45deg, #00f3ff, #0088ff);
-        color: #000;
-        box-shadow: 0 0 15px rgba(0, 243, 255, 0.4);
-        transition: all 0.3s;
-        border: none;
-    }
-    .neon-btn:hover {
-        box-shadow: 0 0 25px rgba(0, 243, 255, 0.7);
-        transform: translateY(-2px);
-    }
-    ::-webkit-scrollbar { width: 8px; }
-    ::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
-    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
+    .neon-btn { background: linear-gradient(45deg, #00f3ff, #0088ff); color: #000; box-shadow: 0 0 15px rgba(0, 243, 255, 0.4); transition: all 0.3s; border: none; }
+    .neon-btn:hover { box-shadow: 0 0 25px rgba(0, 243, 255, 0.7); transform: translateY(-2px); }
+    ::-webkit-scrollbar { width: 8px; } ::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); } ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; } ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
 </style>
 `;
 
 function renderLoginHTML(isError = false) {
     return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>系统后台登录</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    ${globalCSS}
-</head>
-<body class="h-screen flex items-center justify-center relative overflow-hidden">
-    <div class="orb orb-1"></div>
-    <div class="orb orb-2"></div>
-    
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>系统后台登录</title><script src="https://cdn.tailwindcss.com"></script>${globalCSS}</head>
+<body class="h-screen flex items-center justify-center relative overflow-hidden"><div class="orb orb-1"></div><div class="orb orb-2"></div>
     <div class="glass-card p-10 rounded-3xl shadow-2xl w-96 relative z-10 border-t border-l border-white/20">
-        <div class="mb-8 text-center">
-            <h1 class="text-3xl font-bold text-white tracking-wider drop-shadow-md">NODE<span class="neon-text-cyan"> HUB</span></h1>
-            <p class="text-sm text-gray-400 mt-2">安全聚合控制台</p>
-        </div>
+        <div class="mb-8 text-center"><h1 class="text-3xl font-bold text-white tracking-wider drop-shadow-md">NODE<span class="neon-text-cyan"> HUB</span></h1><p class="text-sm text-gray-400 mt-2">安全聚合控制台</p></div>
         ${isError ? '<div class="bg-red-500/20 border border-red-500/50 text-red-300 p-3 mb-6 text-sm rounded backdrop-blur-md">账号或密码错误，请重试</div>' : ''}
         <form action="/login" method="POST" class="space-y-6">
-            <div>
-                <label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 用户名 </label>
-                <input type="text" name="username" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入用户名" required>
-            </div>
-            <div>
-                <label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 密码 </label>
-                <input type="password" name="password" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入密码" required>
-            </div>
-            <button type="submit" class="neon-btn w-full font-bold py-3 px-4 rounded-xl mt-4 uppercase tracking-widest text-sm">
-                授权登录 LOGIN
-            </button>
+            <div><label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 用户名 </label><input type="text" name="username" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入用户名" required></div>
+            <div><label class="block text-gray-300 text-xs font-bold mb-2 uppercase tracking-wide"> 密码 </label><input type="password" name="password" class="glass-input w-full px-4 py-3 rounded-xl placeholder-gray-500" placeholder="请输入密码" required></div>
+            <button type="submit" class="neon-btn w-full font-bold py-3 px-4 rounded-xl mt-4 uppercase tracking-widest text-sm">授权登录 LOGIN</button>
         </form>
     </div>
-</body>
-</html>`;
+</body></html>`;
 }
 
-function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subProtocol, subConverter, subConfig, userAgentHeader) {
+// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】开始 ======
+// 修改渲染 HTML 函数，接收 customNodes 和 configObj
+function renderDashboardHTML(content, customNodes, configObj, guest, url, mytoken, FileName, hasKV, subProtocol, subConverter, subConfig, userAgentHeader) {
+// ====== 【新增功能：可视化二次编辑面板 & 自定义输出节点】结束 ======
     const subItems = [
         { name: '自适应', path: `/${mytoken}?sub`, badge: 'bg-blue-500/20 text-blue-300 border-blue-500/30' },
         { name: 'Base64', path: `/${mytoken}?b64`, badge: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30' },
@@ -383,14 +335,10 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
         <div class="glass-card rounded-xl p-4 flex flex-col justify-between hover:border-[var(--neon-cyan)] hover:shadow-[0_0_15px_rgba(0,243,255,0.2)] transition-all duration-300 group cursor-pointer" onclick="copyTo('${url.origin}${item.path}')">
             <div class="flex justify-between items-start mb-3">
                 <span class="px-2.5 py-1 text-[10px] font-bold rounded border ${item.badge} tracking-wider uppercase">${item.name}</span>
-                <span class="text-gray-500 group-hover:text-[var(--neon-cyan)] transition">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                </span>
+                <span class="text-gray-500 group-hover:text-[var(--neon-cyan)] transition"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></span>
             </div>
             <div class="flex flex-col items-center">
-                <div class="p-1.5 bg-white/90 rounded-lg shadow-sm group-hover:shadow-[0_0_10px_#fff] transition">
-                    <div id="${prefix}_${item.name}"></div>
-                </div>
+                <div class="p-1.5 bg-white/90 rounded-lg shadow-sm group-hover:shadow-[0_0_10px_#fff] transition"><div id="${prefix}_${item.name}"></div></div>
                 <p class="text-[9px] text-gray-500 mt-3 truncate w-full text-center group-hover:text-gray-300 font-mono">${url.origin}${item.path}</p>
             </div>
         </div>
@@ -408,10 +356,7 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
 </head>
 <body class="relative min-h-screen pb-10 overflow-x-hidden">
     <div id="toast-container" class="fixed top-6 right-6 z-[9999] flex flex-col gap-3 pointer-events-none"></div>
-
-    <div class="orb orb-1"></div>
-    <div class="orb orb-2"></div>
-    <div class="orb orb-3"></div>
+    <div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div>
 
     <nav class="glass-card sticky top-0 z-50 border-b-0 border-white/10 mb-8 rounded-b-3xl">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
@@ -426,32 +371,84 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
     </nav>
 
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-        
+        <!-- 左侧功能区 -->
         <div class="lg:col-span-7 flex flex-col gap-6">
-            <div class="glass-card rounded-2xl p-6 flex flex-col h-[650px]">
+            
+            <div class="glass-card rounded-2xl p-6 flex flex-col">
                 <div class="flex justify-between items-center mb-4">
                     <div>
-                        <h2 class="text-lg font-bold text-white tracking-wide">节点编辑器 Node Editor</h2>
-                        <p class="text-[11px] text-gray-400 mt-1 font-mono">Input vmess://, trojan:// or sub links</p>
+                        <h2 class="text-lg font-bold text-white tracking-wide">节点抓取源 (Sub Links)</h2>
+                        <p class="text-[11px] text-gray-400 mt-1 font-mono">在此处填入需要合并处理的订阅源</p>
                     </div>
                     <div class="flex items-center gap-3">
                         <span id="saveStatus" class="text-xs text-[var(--neon-cyan)] font-mono mr-2"></span>
-                        
-                        <button onclick="window.location.reload()" class="flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-gray-300 border border-gray-600 hover:text-white hover:border-red-500/50 hover:bg-red-500/10 transition-all bg-black/20 cursor-pointer">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                            取消恢复
-                        </button>
-                        
                         <button id="saveBtn" class="neon-btn flex items-center justify-center h-10 px-5 gap-2 rounded-xl text-sm font-bold text-black cursor-pointer">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
-                            手动保存
+                            保存配置
                         </button>
                     </div>
                 </div>
                 ${hasKV ? `
-                <textarea id="content" class="glass-input flex-1 w-full p-5 font-mono text-[13px] rounded-xl resize-none leading-relaxed overflow-y-auto text-green-400" placeholder="# 在此处粘贴你的节点或订阅链接...\\n# 后台抓取后会自动全局重命名重名的节点！">${content}</textarea>
-                ` : '<div class="flex-1 flex items-center justify-center bg-red-900/20 rounded-xl border-2 border-dashed border-red-500/50 text-red-400 font-medium backdrop-blur-sm">未绑定 KV 命名空间，请检查 Cloudflare 设置！</div>'}
+                <textarea id="content" class="glass-input w-full p-4 h-[200px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-green-400" placeholder="# 粘贴你的原始节点或订阅链接...">${content}</textarea>
+                ` : '<div class="h-[100px] flex items-center justify-center bg-red-900/20 rounded-xl border-2 border-dashed border-red-500/50 text-red-400 font-medium backdrop-blur-sm">未绑定 KV，无法使用功能</div>'}
             </div>
+
+            <!-- ====== 【新增功能：可视化二次编辑面板】开始 ====== -->
+            ${hasKV ? `
+            <div class="glass-card rounded-2xl p-6">
+                <h2 class="text-lg font-bold text-white mb-1 tracking-wide">节点二次编辑规则 (Rules)</h2>
+                <p class="text-[11px] text-gray-400 mb-4 font-mono">这些规则会自动处理上方抓取到的所有节点</p>
+                
+                <div class="grid grid-cols-2 gap-4 mb-5 border-b border-white/10 pb-5">
+                    <label class="flex items-center space-x-2 cursor-pointer group">
+                        <input type="checkbox" id="cfg_autoEmoji" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.autoEmoji ? 'checked' : ''}>
+                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">自动地区 Emoji (🇭🇰🇯🇵🇺🇸)</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer group">
+                        <input type="checkbox" id="cfg_deepDeduplicate" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.deepDeduplicate ? 'checked' : ''}>
+                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">深度去重 (同 IP 端口剔除)</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer group">
+                        <input type="checkbox" id="cfg_sortNodes" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.sortNodes ? 'checked' : ''}>
+                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">智能排序 (信息节点置顶)</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer group">
+                        <input type="checkbox" id="cfg_dropInvalidNodes" class="form-checkbox text-cyan-400 rounded bg-black/20 border-white/20 h-4 w-4" ${configObj.dropInvalidNodes ? 'checked' : ''}>
+                        <span class="text-xs text-gray-300 group-hover:text-[var(--neon-cyan)] transition">剔除无效节点 (防报错)</span>
+                    </label>
+                </div>
+
+                <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                    <div>
+                        <label class="text-[10px] text-gray-400 block mb-1">正则保留(名称)</label>
+                        <input type="text" id="cfg_retainNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.retainNameRegex || ''}" placeholder="如：香港|日本">
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-gray-400 block mb-1">正则剔除(名称)</label>
+                        <input type="text" id="cfg_dropNameRegex" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.dropNameRegex || ''}" placeholder="如：过期|流量">
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-gray-400 block mb-1">全局重命名</label>
+                        <input type="text" id="cfg_globalRename" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.globalRename || ''}" placeholder="如：专属节点">
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-gray-400 block mb-1">统一前缀</label>
+                        <input type="text" id="cfg_addPrefix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addPrefix || ''}" placeholder="如：🚀 ">
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-gray-400 block mb-1">统一后缀</label>
+                        <input type="text" id="cfg_addSuffix" class="glass-input w-full p-2 text-xs rounded-lg" value="${configObj.addSuffix || ''}" placeholder="如：[Pro]">
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass-card rounded-2xl p-6 flex flex-col">
+                <h2 class="text-lg font-bold text-[var(--neon-purple)] mb-1 tracking-wide">自定义输出节点 (Custom Output)</h2>
+                <p class="text-[11px] text-gray-400 mb-4 font-mono">在此填写的节点将<strong class="text-white">不受上方规则限制</strong>，强制追加到订阅末尾</p>
+                <textarea id="customNodes" class="glass-input w-full p-4 h-[120px] font-mono text-[13px] rounded-xl resize-y leading-relaxed text-pink-400" placeholder="# 粘贴需要强制置入的自建节点...">${customNodes}</textarea>
+            </div>
+            ` : ''}
+            <!-- ====== 【新增功能：可视化二次编辑面板】结束 ====== -->
             
             <div class="glass-card rounded-2xl p-5 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono text-gray-400">
                 <div class="space-y-2">
@@ -466,6 +463,7 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
             </div>
         </div>
 
+        <!-- 右侧分发区 -->
         <div class="lg:col-span-5 flex flex-col gap-6">
             <div class="glass-card rounded-2xl p-6 relative overflow-hidden">
                 <div class="absolute -top-10 -right-10 w-32 h-32 bg-[var(--neon-cyan)] rounded-full mix-blend-screen filter blur-[60px] opacity-20 pointer-events-none"></div>
@@ -499,7 +497,6 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
     </div>
     
     <script>
-        // --- 高级悬浮 Toast 提示功能 ---
         function showToast(message) {
             const container = document.getElementById('toast-container');
             if(!container) return;
@@ -507,15 +504,8 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
             toast.className = 'glass-card px-5 py-3 rounded-xl border border-[var(--neon-cyan)] shadow-[0_0_15px_rgba(0,243,255,0.3)] text-white text-sm font-bold flex items-center gap-3 transform transition-all duration-300 translate-x-[120%] opacity-0';
             toast.innerHTML = \`<span class="text-[var(--neon-cyan)] text-lg leading-none">✓</span> \${message}\`;
             container.appendChild(toast);
-
-            requestAnimationFrame(() => {
-                setTimeout(() => { toast.classList.remove('translate-x-[120%]', 'opacity-0'); }, 10);
-            });
-
-            setTimeout(() => {
-                toast.classList.add('translate-x-[120%]', 'opacity-0');
-                setTimeout(() => toast.remove(), 300);
-            }, 3000);
+            requestAnimationFrame(() => { setTimeout(() => { toast.classList.remove('translate-x-[120%]', 'opacity-0'); }, 10); });
+            setTimeout(() => { toast.classList.add('translate-x-[120%]', 'opacity-0'); setTimeout(() => toast.remove(), 300); }, 3000);
         }
 
         function decodeNodeNameSafe(text) {
@@ -533,87 +523,83 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
 
         const renderQR = (id, text) => {
             const el = document.getElementById(id);
-            if(el) {
-                el.innerHTML = '';
-                new QRCode(el, { text: text, width: 90, height: 90, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.L });
-            }
+            if(el) { el.innerHTML = ''; new QRCode(el, { text: text, width: 90, height: 90, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.L }); }
         };
 
         window.onload = () => {
             ${subItems.map(item => `renderQR('qr_my_${item.name}', '${url.origin}${item.path}');`).join('\n')}
             ${subItems.map(item => `renderQR('qr_guest_${item.name}', '${url.origin}/sub?token=${guest}${item.path.split('?')[1] ? '&'+item.path.split('?')[1] : ''}');`).join('\n')}
             
-            const textarea = document.getElementById('content');
-            if (textarea && textarea.value) {
-                textarea.value = decodeNodeNameSafe(textarea.value);
-            }
+            ['content', 'customNodes'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el && el.value) el.value = decodeNodeNameSafe(el.value);
+            });
         };
 
-        function copyTo(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                showToast('订阅链接已复制到剪贴板！');
-            });
-        }
+        function copyTo(text) { navigator.clipboard.writeText(text).then(() => { showToast('订阅链接已复制到剪贴板！'); }); }
 
         const btn = document.getElementById('saveBtn');
-        const textarea = document.getElementById('content');
-        
-        if(btn && textarea) {
-            const setUnsavedStatus = () => {
-                document.getElementById('saveStatus').innerHTML = '<span class="text-yellow-400 drop-shadow-[0_0_5px_rgba(250,204,21,0.5)]">⚠️ 有未保存的修改</span>';
-            };
+        if(btn) {
+            const setUnsavedStatus = () => { document.getElementById('saveStatus').innerHTML = '<span class="text-yellow-400 drop-shadow-[0_0_5px_rgba(250,204,21,0.5)]">⚠️ 有未修改保存</span>'; };
 
             const saveAction = async () => {
                 btn.innerHTML = '<svg class="animate-spin h-4 w-4 mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> 写入中...';
-                btn.disabled = true;
-                btn.style.filter = "brightness(0.7)";
+                btn.disabled = true; btn.style.filter = "brightness(0.7)";
                 
                 try {
-                    let content = textarea.value.replace(/：/g, ':');
+                    let content = document.getElementById('content').value.replace(/：/g, ':');
                     content = decodeNodeNameSafe(content);
-                    textarea.value = content;
+                    document.getElementById('content').value = content;
                     
-                    const res = await fetch('/admin', { method: 'POST', body: content });
+                    // ====== 【新增功能：前台配置统一打包 POST 给后台】开始 ======
+                    let customNodes = document.getElementById('customNodes') ? document.getElementById('customNodes').value.replace(/：/g, ':') : '';
+                    customNodes = decodeNodeNameSafe(customNodes);
+                    if(document.getElementById('customNodes')) document.getElementById('customNodes').value = customNodes;
+
+                    const payload = {
+                        links: content,
+                        customNodes: customNodes,
+                        config: {
+                            autoEmoji: document.getElementById('cfg_autoEmoji') ? document.getElementById('cfg_autoEmoji').checked : true,
+                            deepDeduplicate: document.getElementById('cfg_deepDeduplicate') ? document.getElementById('cfg_deepDeduplicate').checked : true,
+                            sortNodes: document.getElementById('cfg_sortNodes') ? document.getElementById('cfg_sortNodes').checked : true,
+                            dropInvalidNodes: document.getElementById('cfg_dropInvalidNodes') ? document.getElementById('cfg_dropInvalidNodes').checked : true,
+                            globalRename: document.getElementById('cfg_globalRename') ? document.getElementById('cfg_globalRename').value : '',
+                            addPrefix: document.getElementById('cfg_addPrefix') ? document.getElementById('cfg_addPrefix').value : '',
+                            addSuffix: document.getElementById('cfg_addSuffix') ? document.getElementById('cfg_addSuffix').value : '',
+                            retainNameRegex: document.getElementById('cfg_retainNameRegex') ? document.getElementById('cfg_retainNameRegex').value : '',
+                            dropNameRegex: document.getElementById('cfg_dropNameRegex') ? document.getElementById('cfg_dropNameRegex').value : '',
+                        }
+                    };
+                    
+                    const res = await fetch('/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    // ====== 【新增功能：前台配置统一打包 POST 给后台】结束 ======
+
                     if(res.ok) {
                         const time = new Date().toLocaleTimeString();
                         document.getElementById('saveStatus').innerHTML = '<span class="text-[var(--neon-cyan)]">✓ 保存于 '+time+'</span>';
                         showToast('配置数据已安全存入底层 KV！');
-                    } else {
-                        alert('保存失败，请检查网络');
-                    }
-                } catch(e) {
-                    alert('网络异常');
-                } finally {
-                    btn.innerHTML = '<svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> 手动保存';
-                    btn.disabled = false;
-                    btn.style.filter = "brightness(1)";
+                    } else { alert('保存失败，请检查网络'); }
+                } catch(e) { alert('网络异常'); } finally {
+                    btn.innerHTML = '<svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg> 保存配置';
+                    btn.disabled = false; btn.style.filter = "brightness(1)";
                 }
             };
             
             btn.onclick = saveAction;
             
-            textarea.addEventListener('paste', () => {
-                setTimeout(() => {
-                    const decodedText = decodeNodeNameSafe(textarea.value);
-                    if (textarea.value !== decodedText) { textarea.value = decodedText; }
-                    setUnsavedStatus();
-                }, 50); 
+            document.querySelectorAll('input, textarea').forEach(el => {
+                el.addEventListener('input', setUnsavedStatus);
             });
-
-            textarea.addEventListener('input', setUnsavedStatus);
         }
 
         function toggleNotice() {
             const el = document.getElementById('noticeContent');
             const btn = document.getElementById('noticeToggle');
             if (el.classList.contains('hidden')) {
-                el.classList.remove('hidden');
-                btn.textContent = '收起 ▲';
-                btn.classList.add('text-[var(--neon-cyan)]', 'border-[var(--neon-cyan)]');
+                el.classList.remove('hidden'); btn.textContent = '收起 ▲'; btn.classList.add('text-[var(--neon-cyan)]', 'border-[var(--neon-cyan)]');
             } else {
-                el.classList.add('hidden');
-                btn.textContent = '展开 ▼';
-                btn.classList.remove('text-[var(--neon-cyan)]', 'border-[var(--neon-cyan)]');
+                el.classList.add('hidden'); btn.textContent = '展开 ▼'; btn.classList.remove('text-[var(--neon-cyan)]', 'border-[var(--neon-cyan)]');
             }
         }
     </script>
@@ -623,43 +609,29 @@ function renderDashboardHTML(content, guest, url, mytoken, FileName, hasKV, subP
 
 // ================= 底层基础依赖函数与逻辑 =================
 
-// ====== 【新增功能：节点二次编辑模块】开始 ======
-/**
- * 节点二次编辑核心逻辑：深度去重、过滤、排序、Emoji补充、自动重命名
- */
+// ====== 【新增功能：核心规则解析与执行模块】开始 ======
 function processAndEditSubNodes(content, config) {
     let lines = content.split('\n');
     let parsedNodes = [];
     
-    // 地区与 Emoji 对应字典表
     const EMOJI_MAP = [
-        { regex: /香港|HK|Hong Kong/i, emoji: '🇭🇰' },
-        { regex: /台湾|TW|Taiwan|新北|台北/i, emoji: '🇹🇼' },
-        { regex: /日本|JP|Japan|东京|大阪/i, emoji: '🇯🇵' },
-        { regex: /新加坡|SG|Singapore|狮城/i, emoji: '🇸🇬' },
-        { regex: /美国|US|America|United States|洛杉矶|硅谷|波特兰/i, emoji: '🇺🇸' },
-        { regex: /韩国|KR|Korea|首尔/i, emoji: '🇰🇷' },
-        { regex: /英国|UK|United Kingdom|伦敦/i, emoji: '🇬🇧' },
-        { regex: /德国|DE|Germany|法兰克福/i, emoji: '🇩🇪' },
-        { regex: /法国|FR|France|巴黎/i, emoji: '🇫🇷' },
-        { regex: /土耳其|TR|Turkey/i, emoji: '🇹🇷' },
-        { regex: /印度|IN|India|孟买/i, emoji: '🇮🇳' },
-        { regex: /阿根廷|AR|Argentina/i, emoji: '🇦🇷' }
+        { regex: /香港|HK|Hong Kong/i, emoji: '🇭🇰' }, { regex: /台湾|TW|Taiwan|新北|台北/i, emoji: '🇹🇼' },
+        { regex: /日本|JP|Japan|东京|大阪/i, emoji: '🇯🇵' }, { regex: /新加坡|SG|Singapore|狮城/i, emoji: '🇸🇬' },
+        { regex: /美国|US|America|United States|洛杉矶|硅谷|波特兰/i, emoji: '🇺🇸' }, { regex: /韩国|KR|Korea|首尔/i, emoji: '🇰🇷' },
+        { regex: /英国|UK|United Kingdom|伦敦/i, emoji: '🇬🇧' }, { regex: /德国|DE|Germany|法兰克福/i, emoji: '🇩🇪' },
+        { regex: /法国|FR|France|巴黎/i, emoji: '🇫🇷' }, { regex: /土耳其|TR|Turkey/i, emoji: '🇹🇷' },
+        { regex: /印度|IN|India|孟买/i, emoji: '🇮🇳' }, { regex: /阿根廷|AR|Argentina/i, emoji: '🇦🇷' }
     ];
 
-    // 信息节点特征白名单（遇到这些关键词，不剔除不改名，原样保留）
     const INFO_NODE_REGEX = /流量|剩余|到期|过期|时间|Expire|Traffic|官网|更新|群|公告/i;
 
-    // 1. 初步解析所有节点
     for (let line of lines) {
         line = line.trim();
         if (!line) continue;
-        
         let node = parseSingleNode(line);
         if (node && node.valid) {
             parsedNodes.push(node);
         } else if (line.includes('://')) {
-            // 对于解析失败但像节点的（可能是特殊的订阅信息节点），先标为无效存起来
             parsedNodes.push({ valid: false, raw: line, isInfoNode: INFO_NODE_REGEX.test(line), name: line });
         }
     }
@@ -667,44 +639,32 @@ function processAndEditSubNodes(content, config) {
     const uniqueIdentifiers = new Set();
     let finalNodes = [];
 
-    // 2. 执行过滤、去重与重命名逻辑
     for (let node of parsedNodes) {
-        // 如果是无效节点
         if (!node.valid) {
-            if (node.isInfoNode) {
-                finalNodes.push(node); // 保留信息节点
-            } else if (!config.dropInvalidNodes) {
-                finalNodes.push(node); // 如果未开启剔除无效节点，也保留
-            }
+            if (node.isInfoNode) finalNodes.push(node); 
+            else if (!config.dropInvalidNodes) finalNodes.push(node); 
             continue; 
         }
 
-        // 白名单保护机制
         if (INFO_NODE_REGEX.test(node.name)) {
             node.isInfoNode = true;
             finalNodes.push(node);
             continue;
         }
 
-        // 协议级过滤
         if (config.retainProtocols.length > 0 && !config.retainProtocols.includes(node.protocol)) continue;
         if (config.dropProtocols.length > 0 && config.dropProtocols.includes(node.protocol)) continue;
-
-        // 名称正则过滤 (保留/剔除)
         if (config.retainNameRegex && !new RegExp(config.retainNameRegex, 'i').test(node.name)) continue;
         if (config.dropNameRegex && new RegExp(config.dropNameRegex, 'i').test(node.name)) continue;
 
-        // 深度去重 (依据: 协议+IP+端口+ID，若相同则认为是同一节点)
         if (config.deepDeduplicate) {
             const identifier = `${node.protocol}:${node.address}:${node.port}:${node.id}`;
             if (uniqueIdentifiers.has(identifier)) continue; 
             uniqueIdentifiers.add(identifier);
         }
 
-        // 全局重命名
         if (config.globalRename) node.name = config.globalRename;
 
-        // 自动补充地区 Emoji (仅在名称本身没有 Emoji 时补充)
         if (config.autoEmoji && !/(?:[\u2700-\u27bf]|(?:\ud83c[\udde6-\uddff]){2}|[\ud800-\udbff][\udc00-\udfff]|[\u0023-\u0039]\ufe0f?\u20e3|\u3299|\u3297|\u303d|\u3030|\u24c2|\ud83c[\udd70-\udd71]|\ud83c[\udd7e-\udd7f]|\ud83c\udd8e|\ud83c[\udd91-\udd9a]|\ud83c[\udde6-\uddff])/.test(node.name)) {
             for (const item of EMOJI_MAP) {
                 if (item.regex.test(node.name) || item.regex.test(node.originalName)) {
@@ -714,20 +674,14 @@ function processAndEditSubNodes(content, config) {
             }
         }
 
-        // 批量前后缀
         if (config.addPrefix) node.name = config.addPrefix + node.name;
         if (config.addSuffix) node.name = node.name + config.addSuffix;
 
         finalNodes.push(node);
     }
 
-    // 3. 统计重名，自动编号自增 (如: 香港节点 01, 香港节点 02)
     const nameFrequencies = {};
-    finalNodes.forEach(n => {
-        if (!n.isInfoNode && n.valid) {
-            nameFrequencies[n.name] = (nameFrequencies[n.name] || 0) + 1;
-        }
-    });
+    finalNodes.forEach(n => { if (!n.isInfoNode && n.valid) nameFrequencies[n.name] = (nameFrequencies[n.name] || 0) + 1; });
 
     const nameIndex = {};
     finalNodes.forEach(n => {
@@ -738,7 +692,6 @@ function processAndEditSubNodes(content, config) {
         }
     });
 
-    // 4. 节点智能排序
     if (config.sortNodes) {
         finalNodes.sort((a, b) => {
             if (a.isInfoNode && !b.isInfoNode) return -1;
@@ -748,52 +701,34 @@ function processAndEditSubNodes(content, config) {
         });
     }
 
-    // 5. 重新打包拼接节点
     return finalNodes.map(n => {
-        if (!n.valid) return n.raw; // 还原无效但受保护的节点
+        if (!n.valid) return n.raw;
         return rebuildSingleNode(n);
     }).join('\n');
 }
 
-// 辅助工具：单节点解析器
 function parseSingleNode(line) {
     try {
         if (line.startsWith('vmess://')) {
-            // 补充 Base64 的 padding 以防报错
             let b64Str = line.substring(8).replace(/-/g, '+').replace(/_/g, '/');
             while (b64Str.length % 4 !== 0) b64Str += '=';
             let jsonStr = base64Decode(b64Str);
             let cfg = JSON.parse(jsonStr);
             return {
-                valid: !!cfg.add && !!cfg.port, // 简单合法性校验
-                protocol: 'vmess',
-                name: cfg.ps || 'vmess',
-                originalName: cfg.ps || 'vmess',
-                address: cfg.add || '',
-                port: cfg.port || '',
-                id: cfg.id || '',
-                config: cfg
+                valid: !!cfg.add && !!cfg.port, protocol: 'vmess', name: cfg.ps || 'vmess', originalName: cfg.ps || 'vmess',
+                address: cfg.add || '', port: cfg.port || '', id: cfg.id || '', config: cfg
             };
         } else {
             let urlObj = new URL(line);
             let name = decodeURIComponent(urlObj.hash.slice(1) || '');
             return {
-                valid: !!urlObj.hostname && !!urlObj.port,
-                protocol: urlObj.protocol.replace(':', ''),
-                name: name,
-                originalName: name,
-                address: urlObj.hostname,
-                port: urlObj.port,
-                id: urlObj.username || '',
-                urlObj: urlObj
+                valid: !!urlObj.hostname && !!urlObj.port, protocol: urlObj.protocol.replace(':', ''), name: name, originalName: name,
+                address: urlObj.hostname, port: urlObj.port, id: urlObj.username || '', urlObj: urlObj
             };
         }
-    } catch (e) {
-        return { valid: false }; // 解析报错，抛弃或留作信息节点
-    }
+    } catch (e) { return { valid: false }; }
 }
 
-// 辅助工具：单节点重组器
 function rebuildSingleNode(node) {
     if (node.protocol === 'vmess') {
         node.config.ps = node.name;
@@ -804,8 +739,7 @@ function rebuildSingleNode(node) {
         return urlObj.toString();
     }
 }
-// ====== 【新增功能：节点二次编辑模块】结束 ======
-
+// ====== 【新增功能：核心规则解析与执行模块】结束 ======
 
 async function ADD(envadd) {
     var addtext = envadd.replace(/[  "'|\r\n]+/g, '\n').replace(/\n+/g, '\n');
